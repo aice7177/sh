@@ -42,7 +42,7 @@ chmod +x /app/openlist/openlist
 # 6. 初始化管理员，获取密码
 cd /app/openlist
 ADMIN_OUTPUT=$(./openlist admin)
-PASSWORD=$(echo "$ADMIN_OUTPUT" | grep -Eo 'Password: .*' | cut -d' ' -f2)
+PASSWORD=$(echo "$ADMIN_OUTPUT" | grep -Eo 'Password: .*' | awk '{print $2}')
 
 # 7. 修改配置端口
 CONFIG_FILE=/app/openlist/data/config.json
@@ -54,7 +54,7 @@ groupadd --system openlist || true
 useradd --system --gid openlist --create-home --shell /usr/sbin/nologin --comment "openlist" openlist || true
 chown -R openlist:openlist /app/openlist
 
-# 9. 创建 systemd 服务
+# 9. 创建并启动 systemd 服务
 cat >/etc/systemd/system/openlist.service <<EOF
 [Unit]
 Description=OpenList 服务
@@ -72,7 +72,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable openlist.service
+enable openlist.service
 systemctl start openlist.service
 
 # 10. 申请 SSL 证书
@@ -85,7 +85,7 @@ mkdir -p /etc/nginx/ssl
     --fullchain-file /etc/nginx/ssl/$WWW_DOMAIN.crt \
     --key-file /etc/nginx/ssl/$WWW_DOMAIN.key --ecc
 
-# 11. 配置 Nginx
+# 11. 配置 Nginx 反向代理
 cat >/etc/nginx/nginx.conf <<EOF
 user  root;
 worker_processes auto;
@@ -164,6 +164,7 @@ After=network.target
 Type=oneshot
 ExecStart=$CHECK_SCRIPT
 EOF
+
 cat >/etc/systemd/system/checkspace.timer <<EOF
 [Unit]
 Description=每20秒运行一次磁盘检测
@@ -177,14 +178,12 @@ Unit=checkspace.service
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-systemctl enable checkspace.timer
+enable checkspace.timer
 systemctl start checkspace.timer
 
 # 13. 完成提示
 echo
-s```bash
 echo "OpenList 安装并启动完成！"
 echo "用户名: admin"
 echo "密码: $PASSWORD"
 echo "端口: $PORT"
-```
