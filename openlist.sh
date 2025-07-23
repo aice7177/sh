@@ -25,7 +25,6 @@ echo "检测到根分区设备：$ROOT_DEV"
 
 # 4. 检查并安装必要依赖（包含 nginx）
 apt-get update
-# 必装依赖
 apt-get install -y wget tar socat curl cron jq
 
 # 判断 nginx 是否已安装
@@ -58,27 +57,11 @@ groupadd --system openlist || true
 useradd --system --gid openlist --create-home --shell /usr/sbin/nologin --comment "openlist" openlist || true
 chown -R openlist:openlist /app/openlist
 
-# 9. 创建并启用 OpenList systemd 服务
-cat >/etc/systemd/system/openlist.service <<EOF
-[Unit]
-Description=OpenList 服务
-After=network.target
-
-[Service]
-User=openlist
-Group=openlist
-Type=simple
-WorkingDirectory=/app/openlist
-ExecStart=/app/openlist/openlist server --port $PORT
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable openlist.service
-systemctl start openlist.service
+# 9. 启动 OpenList（后台运行）
+# 使用 nohup 将日志写入 /var/log/openlist.log，并在后台运行
+mkdir -p /var/log
+nohup /app/openlist/openlist server --port "$PORT" > /var/log/openlist.log 2>&1 &
+echo "OpenList 已后台启动，日志路径：/var/log/openlist.log"
 
 # 10. 申请并安装 SSL 证书（acme.sh）
 systemctl stop nginx || true
