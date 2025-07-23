@@ -1,168 +1,142 @@
 #!/bin/bash
 
 #================================================================================
-# OpenList 全自动安装与配置脚本 for Debian/Ubuntu
+# OpenList 一键安装与配置脚本 (适用于 Debian/Ubuntu)
 #
 # 功能:
-#   - 自动安装 OpenList
-#   - 自动配置 Systemd 守护进程
-#   - 自动安装/配置 Nginx 反向代理
-#   - 自动申请 Let's Encrypt SSL 证书 (by acme.sh)
-#   - 自动实现磁盘容量显示和界面美化
+#   - 自动安装 OpenList 及其依赖
+#   - 自动处理 Nginx 安装与反向代理配置
+#   - 自动申请 Let's Encrypt SSL 证书 (acme.sh)
+#   - 自动配置 systemd 守护进程与开机自启
+#   - 自动生成并配置磁盘容量显示功能
+#   - 使用随机端口，并最终显示所有配置信息
 #
 #================================================================================
 
-# 字体颜色
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-PLAIN='\033[0m'
+# 颜色定义
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+NC="\033[0m"
+
+# 错误退出
+set -e
 
 # 检查是否为 root 用户
-if [ "$(id -u)" != "0" ]; then
-   echo -e "${RED}错误: 此脚本必须以 root 用户权限运行。${PLAIN}" 1>&2
-   exit 1
-fi
-
-# 检查系统是否使用 Systemd
-if ! command -v systemctl &> /dev/null; then
-    echo -e "${RED}错误: 看不见 'systemctl' 命令, 本脚本只支持使用 Systemd 的系统。${PLAIN}"
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误：此脚本必须以 root 用户身份运行。${NC}"
     exit 1
 fi
 
-# 变量初始化
-DOMAIN=""
-STORAGE_PATH=""
-OPENLIST_PORT=""
-ADMIN_PASSWORD=""
-NGINX_INSTALLED=false
+# 欢迎信息
+echo -e "${BLUE}=====================================================${NC}"
+echo -e "${BLUE}        OpenList 一键安装与配置脚本              ${NC}"
+echo -e "${BLUE}=====================================================${NC}"
 
-# 捕获中断信号
-trap 'echo -e "\n${RED}安装被用户中断。${PLAIN}"; exit 1' INT
+# 1. 域名输入与验证
+#----------------------------------------------------
+install_deps_for_domain_check() {
+    echo -e "${GREEN}正在安装域名检查所需依赖 (curl)...${NC}"
+    if ! command -v curl &> /dev/null; then
+        apt-get update && apt-get install -y curl
+    fi
+}
 
-# 函数：获取用户输入
-get_user_input() {
-    # 循环直到获得有效的域名
+ask_for_domain() {
+    install_deps_for_domain_check
     while true; do
-        read -p "请输入您的域名 (例如 www.example.com): " DOMAIN
-        if [[ -z "$DOMAIN" ]]; then
-            echo -e "${RED}域名不能为空，请重新输入!${PLAIN}"
-        elif ! echo "$DOMAIN" | grep -Pq '(?=^.{4,253}$)(^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$)'; then
-            echo -e "${RED}域名格式不正确，请重新输入!${PLAIN}"
+        read -p "请输入您的域名 (例如: mydomain.com 或 openlist.mydomain.com): " USER_DOMAIN
+        if [[ -z "$USER_DOMAIN" ]]; then
+            echo -e "${RED}域名不能为空，请重新输入。${NC}"
+            continue
+        fi
+
+        # 简单的域名格式验证
+        if ! [[ "$USER_DOMAIN" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            echo -e "${RED}域名格式不正确，请重新输入。${NC}"
+            continue
+        fi
+
+        # 检查域名解析
+        echo -e "${YELLOW}正在验证域名解析，请确保您的域名已正确解析到本服务器IP...${NC}"
+        DOMAIN_IP=$(curl -s "https://dns.google/resolve?name=$USER_DOMAIN&type=A" | grep -oP '"data": "\K[^"]+' | head -n 1)
+        SERVER_IP=$(curl -s ifconfig.me)
+
+        if [ "$DOMAIN_IP" == "$SERVER_IP" ]; then
+            echo -e "${GREEN}域名解析验证成功！ ($USER_DOMAIN -> $SERVER_IP)${NC}"
+            break
         else
-            # 检查域名解析
-            echo -e "${YELLOW}正在验证域名解析...${PLAIN}"
-            local domain_ip
-            domain_ip=$(ping -c 1 "$DOMAIN" | sed '1{s/[^(]*(//;s/).*//;q;}')
-            local local_ip
-            local_ip=$(curl -s ip.sb)
-            if [ "$domain_ip" == "$local_ip" ]; then
-                echo -e "${GREEN}域名解析正确，IP 为: ${domain_ip}${PLAIN}"
+            echo -e "${RED}错误：域名 ($USER_DOMAIN) 未解析到当前服务器IP ($SERVER_IP)。${NC}"
+            echo -e "${RED}解析到的IP为：$DOMAIN_IP ${NC}"
+            read -p "是否继续安装？(y/n): " choice
+            if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
                 break
-            else
-                echo -e "${RED}错误: 域名 ${DOMAIN} 未解析到本机公网 IP (${local_ip})。${PLAIN}"
-                echo -e "${RED}检测到的域名 IP 为: ${domain_ip}。请先设置好 DNS 解析再运行脚本。${PLAIN}"
-                exit 1
             fi
         fi
     done
-
-    # 循环直到获得有效的存储路径
-    while true; do
-        read -p "请输入 OpenList 的本地存储路径 (例如 /data/openlist_files, 默认为 /app/openlist/data/local): " STORAGE_PATH
-        STORAGE_PATH=${STORAGE_PATH:-/app/openlist/data/local} # 设置默认值
-        
-        # 检查路径是否为绝对路径
-        if [[ ! "$STORAGE_PATH" =~ ^/ ]]; then
-            echo -e "${RED}路径必须为绝对路径 (以 / 开头)，请重新输入!${PLAIN}"
-        else
-            break
-        fi
-    done
 }
 
-# 函数：安装依赖
+
+# 2. 安装依赖
+#----------------------------------------------------
 install_dependencies() {
-    echo -e "${GREEN}正在更新软件包列表并安装依赖...${PLAIN}"
-    apt-get update > /dev/null 2>&1
-    if ! apt-get install -y wget tar curl socat cron &> /dev/null; then
-        echo -e "${RED}依赖安装失败，请检查您的软件源。${PLAIN}"
-        exit 1
-    fi
-
-    # 检查 Nginx
-    if command -v nginx &> /dev/null; then
-        NGINX_INSTALLED=true
-        echo -e "${YELLOW}检测到 Nginx 已安装。${PLAIN}"
-    else
-        echo -e "${GREEN}正在安装 Nginx...${PLAIN}"
-        if ! apt-get install -y nginx &> /dev/null; then
-            echo -e "${RED}Nginx 安装失败。${PLAIN}"
-            exit 1
-        fi
-        systemctl enable nginx > /dev/null 2>&1
-    fi
+    echo -e "${GREEN}正在更新软件包列表并安装所需依赖...${NC}"
+    apt-get update
+    apt-get install -y wget tar socat cron jq
 }
 
-# 函数：安装 OpenList
+# 3. 安装 OpenList
+#----------------------------------------------------
 install_openlist() {
-    echo -e "${GREEN}正在安装 OpenList...${PLAIN}"
+    echo -e "${GREEN}开始安装 OpenList...${NC}"
     
-    # 1. 下载并解压
+    # 下载和解压
+    wget https://github.com/OpenListTeam/OpenList/releases/latest/download/openlist-linux-amd64.tar.gz -O openlist-linux-amd64.tar.gz
+    tar -zxvf openlist-linux-amd64.tar.gz
+    
+    # 创建目录和设置权限
     mkdir -p /app/openlist
-    cd /app
-    if ! wget -O openlist-linux-amd64.tar.gz https://github.com/OpenListTeam/OpenList/releases/latest/download/openlist-linux-amd64.tar.gz; then
-        echo -e "${RED}OpenList 下载失败，请检查网络或 GitHub Release 页面。${PLAIN}"
+    mv openlist /app/openlist
+    chmod +x /app/openlist/openlist
+    
+    # 创建 OpenList 用户和组
+    echo -e "${GREEN}正在创建用于运行 OpenList 的系统用户...${NC}"
+    groupadd --system openlist || true
+    useradd --system --gid openlist --create-home --shell /usr/sbin/nologin --comment "openlist" openlist || true
+
+    # 切换到工作目录
+    cd /app/openlist
+
+    # 首次运行以生成配置文件并捕获密码
+    echo -e "${YELLOW}首次启动 OpenList 以获取初始密码...${NC}"
+    ./openlist server > openlist_initial_run.log 2>&1 &
+    SERVER_PID=$!
+    
+    # 等待几秒钟让程序初始化
+    sleep 5
+    
+    INITIAL_PASSWORD=$(grep 'initial password is:' openlist_initial_run.log | awk -F': ' '{print $2}')
+    kill $SERVER_PID
+    
+    if [ -z "$INITIAL_PASSWORD" ]; then
+        echo -e "${RED}错误：无法获取 OpenList 初始密码。请检查日志 /app/openlist/openlist_initial_run.log ${NC}"
         exit 1
     fi
-    tar -zxvf openlist-linux-amd64.tar.gz -C /app/openlist > /dev/null 2>&1
-    rm -f openlist-linux-amd64.tar.gz
-    chmod +x /app/openlist/openlist
+    echo -e "${GREEN}成功获取初始密码！${NC}"
 
-    # 2. 首次运行以生成配置和密码
-    echo -e "${GREEN}正在初始化 OpenList 并获取管理员密码...${PLAIN}"
-    cd /app/openlist
-    # 使用 expect 自动化首次运行，捕获密码
-    ADMIN_PASSWORD=$(./openlist admin | grep 'password:' | awk '{print $NF}')
+    # 生成随机端口
+    LISTEN_PORT=$((RANDOM % 40000 + 10000))
+    echo -e "${GREEN}为 OpenList 生成随机端口: $LISTEN_PORT ${NC}"
     
-    if [ -z "$ADMIN_PASSWORD" ]; then
-        echo -e "${RED}获取初始管理员密码失败，正在尝试重置...${PLAIN}"
-        ADMIN_PASSWORD=$(./openlist admin random | grep 'New password' | awk '{print $NF}')
-        if [ -z "$ADMIN_PASSWORD" ]; then
-            echo -e "${RED}重置密码也失败了，请检查程序。${PLAIN}"
-            exit 1
-        fi
-    fi
-
-    # 启动一次服务器以生成 config.json
-    ./openlist server &
-    local openlist_pid=$!
-    sleep 5 # 等待 config.json 生成
-    kill $openlist_pid
-    wait $openlist_pid 2>/dev/null
-
-
-    # 3. 修改端口为随机高位端口
-    OPENLIST_PORT=$(shuf -i 49152-65535 -n 1)
-    sed -i 's/"http_port": 5244/"http_port": '"$OPENLIST_PORT"'/' /app/openlist/data/config.json
+    # 使用 jq 修改配置文件中的端口
+    jq --argjson port "$LISTEN_PORT" '.port = $port' data/config.json > data/config.tmp && mv data/config.tmp data/config.json
     
-    # 4. 设置根文件夹路径
-    # 将 JSON 路径中的反斜杠转义
-    local escaped_storage_path
-    escaped_storage_path=$(echo "$STORAGE_PATH" | sed 's/\//\\\//g')
-    sed -i 's/"root_folder_path": "\/"/"root_folder_path": "'"$escaped_storage_path"'"/' /app/openlist/data/config.json
-    # 关闭允许挂载
-    sed -i 's/"allow_mounted": true/"allow_mounted": false/' /app/openlist/data/config.json
-
-
-    # 5. 创建守护进程
-    echo -e "${GREEN}正在创建 OpenList 的 Systemd 服务...${PLAIN}"
-    groupadd --system openlist > /dev/null 2>&1
-    useradd --system --gid openlist --no-create-home --shell /usr/sbin/nologin --comment "openlist" openlist > /dev/null 2>&1
-    
+    # 设置守护进程
+    echo -e "${GREEN}正在创建 systemd 服务...${NC}"
     cat > /etc/systemd/system/openlist.service <<EOF
 [Unit]
-Description=OpenList Service
+Description=openlist
 After=network.target
 
 [Service]
@@ -177,102 +151,81 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-    # 6. 设置权限并启动
-    mkdir -p "$STORAGE_PATH"
+    # 设置本地存储目录
+    mkdir -p /html/网盘
+    chown -R openlist:openlist /html/网盘
     chown -R openlist:openlist /app/openlist
-    chown -R openlist:openlist "$STORAGE_PATH"
 
+    # 启动服务
     systemctl daemon-reload
-    systemctl enable openlist > /dev/null 2>&1
+    systemctl enable openlist
     systemctl start openlist
+    echo -e "${GREEN}OpenList 服务已启动。${NC}"
 }
 
-# 函数：配置 Nginx 和 SSL
-configure_nginx_ssl() {
-    echo -e "${GREEN}正在配置 Nginx 和申请 SSL 证书...${PLAIN}"
-    
-    # 1. 申请证书
-    systemctl stop nginx
-    
-    # 安装 acme.sh
-    if [ ! -d ~/.acme.sh ]; then
-        curl https://get.acme.sh | sh
+# 4. 配置 Nginx 反向代理
+#----------------------------------------------------
+setup_nginx_reverse_proxy() {
+    echo -e "${GREEN}开始配置 Nginx 反向代理...${NC}"
+
+    # 检查并安装 Nginx
+    if ! command -v nginx &> /dev/null; then
+        echo -e "${YELLOW}未检测到 Nginx，正在安装...${NC}"
+        apt-get install -y nginx
+    else
+        echo -e "${GREEN}Nginx 已安装。${NC}"
     fi
+
+    # 停止 Nginx 以便 acme.sh 使用80端口
+    systemctl stop nginx
+
+    # 安装并配置 acme.sh
+    echo -e "${GREEN}正在安装 acme.sh 并申请 SSL 证书...${NC}"
+    curl https://get.acme.sh | sh
     source ~/.bashrc
     
-    echo -e "${YELLOW}正在使用 acme.sh 申请证书，请稍候...${PLAIN}"
-    
-    local root_domain
-    local www_domain_arg=""
     # 处理域名
-    if [[ $DOMAIN == www.* ]]; then
-        root_domain=${DOMAIN#www.}
-        www_domain_arg="-d $root_domain"
-    else
-        root_domain=$DOMAIN
-    fi
-
-    if ! ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt; then
-        echo -e "${RED}设置默认 CA 失败。${PLAIN}"
-        systemctl start nginx
-        exit 1
-    fi
-
-    if ! ~/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" $www_domain_arg -k ec-256; then
-        echo -e "${RED}SSL 证书申请失败。请检查域名解析和端口 80 是否被占用。${PLAIN}"
-        systemctl start nginx
-        exit 1
-    fi
+    ACME_DOMAINS="-d $USER_DOMAIN"
+    NGINX_SERVER_NAME="$USER_DOMAIN"
+    count=$(echo "$USER_DOMAIN" | tr -cd '.' | wc -c)
     
-    mkdir -p /etc/nginx/ssl/
-    if ! ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --fullchain-file "/etc/nginx/ssl/$DOMAIN.crt" --key-file "/etc/nginx/ssl/$DOMAIN.key" --ecc; then
-        echo -e "${RED}证书安装失败。${PLAIN}"
-        systemctl start nginx
-        exit 1
+    if [[ "$USER_DOMAIN" == www.* ]]; then
+        MAIN_DOMAIN="${USER_DOMAIN#www.}"
+        ACME_DOMAINS="-d $USER_DOMAIN -d $MAIN_DOMAIN"
+        NGINX_SERVER_NAME="$MAIN_DOMAIN $USER_DOMAIN"
+        PRIMARY_DOMAIN="$USER_DOMAIN"
+    elif [ "$count" -eq 1 ]; then # 例如 mydomain.com
+        MAIN_DOMAIN="$USER_DOMAIN"
+        WWW_DOMAIN="www.$USER_DOMAIN"
+        ACME_DOMAINS="-d $MAIN_DOMAIN -d $WWW_DOMAIN"
+        NGINX_SERVER_NAME="$MAIN_DOMAIN $WWW_DOMAIN"
+        PRIMARY_DOMAIN="www.$MAIN_DOMAIN" # 默认重定向到 www
+    else # 例如 sub.mydomain.com
+        PRIMARY_DOMAIN="$USER_DOMAIN"
     fi
+
+    # 申请证书
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    ~/.acme.sh/acme.sh --issue --standalone $ACME_DOMAINS -k ec-256 --force
+
+    # 安装证书
+    SSL_CERT_PATH="/etc/nginx/ssl/${PRIMARY_DOMAIN}.crt"
+    SSL_KEY_PATH="/etc/nginx/ssl/${PRIMARY_DOMAIN}.key"
+    mkdir -p /etc/nginx/ssl
+    ~/.acme.sh/acme.sh --installcert $ACME_DOMAINS --fullchain-file $SSL_CERT_PATH --key-file $SSL_KEY_PATH --ecc --force
     
-    # 2. 配置 Nginx
-    if [ "$NGINX_INSTALLED" = false ]; then
-        # 如果是新安装的Nginx，写入一个基础的 nginx.conf
-        cat > /etc/nginx/nginx.conf <<EOF
-user root;
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-    log_format  main  '\$remote_addr - \$remote_user [\$time_local] "\$request" '
-                      '\$status \$body_bytes_sent "\$http_referer" '
-                      '"\$http_user_agent" "\$http_x_forwarded_for"';
-    access_log /var/log/nginx/access.log main;
-    sendfile on;
-    keepalive_timeout 120;
-    client_max_body_size 20000m;
-    include /etc/nginx/conf.d/*.conf;
-}
-EOF
-    fi
-
-    # 创建 OpenList 的 Nginx 配置文件
+    # 配置 Nginx
+    echo -e "${GREEN}正在生成 Nginx 配置文件...${NC}"
     cat > /etc/nginx/conf.d/openlist.conf <<EOF
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name $DOMAIN;
+    server_name ${NGINX_SERVER_NAME};
 
-    ssl_certificate /etc/nginx/ssl/$DOMAIN.crt;
-    ssl_certificate_key /etc/nginx/ssl/$DOMAIN.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers TLS13-AES-256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256:EECDH+AESGCM:EDH+AESGCM;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ssl_certificate       ${SSL_CERT_PATH};
+    ssl_certificate_key   ${SSL_KEY_PATH};
+    ssl_protocols         TLSv1.3 TLSv1.2;
+    ssl_ciphers           TLS13-AES-256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256:EECDH+AESGCM:EDH+AESGCM;
 
     location / {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -280,150 +233,161 @@ server {
         proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:$OPENLIST_PORT;
-        client_max_body_size 20000m;
+        proxy_pass http://127.0.0.1:${LISTEN_PORT};
+        client_max_body_size 0; # 无限制上传大小
     }
 }
 
 server {
     listen 80;
     listen [::]:80;
-    server_name $DOMAIN;
-    return 301 https://\$server_name\$request_uri;
+    server_name ${NGINX_SERVER_NAME};
+    return 301 https://${PRIMARY_DOMAIN}\$request_uri;
 }
 EOF
-
-    # 如果是 www 域名，添加从根域名到 www 的重定向
-    if [[ $DOMAIN == www.* ]]; then
-    cat >> /etc/nginx/conf.d/openlist.conf <<EOF
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $root_domain;
-    return 301 https://$DOMAIN\$request_uri;
-}
-EOF
-    fi
-
-    # 3. 重启 Nginx
-    systemctl restart nginx
-    echo -e "${GREEN}Nginx 配置完成。${PLAIN}"
-}
-
-# 函数：设置美化和磁盘显示
-setup_beautification() {
-    echo -e "${GREEN}正在配置美化与磁盘容量显示功能...${PLAIN}"
     
-    # 1. 自动检测磁盘分区
-    local disk_partition
-    disk_partition=$(df "$STORAGE_PATH" | awk 'NR==2 {print $1}')
-    if [ -z "$disk_partition" ]; then
-        echo -e "${YELLOW}警告: 无法自动检测存储路径 '${STORAGE_PATH}' 所在的分区。磁盘容量脚本可能不工作。${PLAIN}"
-        # 使用一个通用但可能不准确的回退值
-        disk_partition="/dev/vda1"
-    else
-        echo -e "${GREEN}成功检测到存储分区为: ${disk_partition}${PLAIN}"
-    fi
+    # 检查 Nginx 配置并重启
+    nginx -t
+    systemctl restart nginx
+    echo -e "${GREEN}Nginx 配置完成并已重启。${NC}"
+}
 
-    local txt_file_path="$STORAGE_PATH/本地磁盘空间.txt"
 
-    # 2. 创建用于显示磁盘容量的脚本
-    cat > /app/openlist/check_space.sh <<EOF
+# 5. 配置美化及磁盘容量显示
+#----------------------------------------------------
+setup_beautification() {
+    echo -e "${GREEN}开始配置磁盘容量显示功能...${NC}"
+    
+    # 自动检测根目录所在分区
+    DISK_PARTITION=$(df -P / | awk 'NR==2 {print $1}')
+    echo -e "${YELLOW}自动检测到系统根分区为: $DISK_PARTITION ${NC}"
+    
+    # 创建显示磁盘空间的脚本
+    cat > /app/openlist/check_disk_space.sh <<EOF
 #!/bin/bash
-all=\$(df -h | grep -w ${disk_partition} | awk '{ print \$2 }')
-free=\$(df -h | grep -w ${disk_partition} | awk '{ print \$4 }')
-if [ "\${free}x" != \$(awk '{print \$4}' "${txt_file_path}")x ]; then
-    echo "本地磁盘可用空间: \${free} / \${all}" > "${txt_file_path}"
-fi
-EOF
-    chmod +x /app/openlist/check_space.sh
-    # 立即执行一次以创建文件
-    /app/openlist/check_space.sh
-    chown openlist:openlist "$txt_file_path"
+all=\$(df -h | grep -w ${DISK_PARTITION} | awk '{ print \$2 }')
+free=\$(df -h | grep -w ${DISK_PARTITION} | awk '{ print \$4 }')
+TXT_FILE="/html/网盘/本地磁盘空间.txt"
 
-    # 3. 创建 Systemd 定时器来定期更新磁盘信息
+# 首次运行时创建文件
+if [ ! -f "\$TXT_FILE" ]; then
+    touch "\$TXT_FILE"
+    chown openlist:openlist "\$TXT_FILE"
+fi
+
+# 写入或更新内容
+echo "本地磁盘可用空间: \${free} / \${all}" > "\$TXT_FILE"
+
+EOF
+
+    chmod +x /app/openlist/check_disk_space.sh
+
+    # 创建 systemd service
     cat > /etc/systemd/system/checkspace.service <<EOF
 [Unit]
-Description=Check Disk Space for OpenList
+Description=Update Disk Space Info for OpenList
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=/app/openlist/check_space.sh
+ExecStart=/app/openlist/check_disk_space.sh
 EOF
 
+    # 创建 systemd timer 定时器
     cat > /etc/systemd/system/checkspace.timer <<EOF
 [Unit]
-Description=Run check_space.sh every 30 seconds
+Description=Run checkspace service every 5 minutes
 
 [Timer]
-OnBootSec=30
-OnUnitActiveSec=30
+OnBootSec=1min
+OnUnitActiveSec=5min
 Unit=checkspace.service
 
 [Install]
 WantedBy=timers.target
 EOF
 
+    # 启动定时器
     systemctl daemon-reload
-    systemctl enable checkspace.timer > /dev/null 2>&1
+    systemctl enable checkspace.timer
     systemctl start checkspace.timer
+    # 立即执行一次以生成文件
+    /app/openlist/check_disk_space.sh
 
-    # 4. 生成自定义HTML并注入到OpenList配置中
-    # 注意：这里的 /dav/ 是 OpenList 默认本地存储的WebDAV路径前缀
-    local txt_file_url="https://$DOMAIN/dav/本地磁盘空间.txt"
+    echo -e "${GREEN}磁盘容量监控定时器已设置。${NC}"
+    echo -e "${YELLOW}请注意：您需要在OpenList的“设置”->“存储”中添加一个“本地存储”，将“根文件夹路径”填写为 /html/网盘。${NC}"
+    echo -e "${YELLOW}然后，在“设置”->“全局”->“自定义内容”中粘贴以下代码以显示磁盘容量。${NC}"
     
-    # 创建包含JSON转义字符的HTML代码
-    local custom_html
-    custom_html=$(cat <<EOF
-<!DOCTYPE html><html><head><meta charset="utf-8" /><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" /><meta http-equiv="Pragma" content="no-cache" /><meta http-equiv="Expires" content="0" /><div id="customize" style="display: none;"><div id="content" style="text-align: center ; font-weight: bold; margin-top: 10px;"></div><style>.footer span,.footer a:nth-of-type(1){display:none;}.footer span,.footer a:nth-of-type(2){display:none;}.hope-stack.hope-c-dhzjXW.hope-c-PJLV.hope-c-PJLV-ihYBJPK-css {display: none !important;}</style><div style="text-align: center ; "><p align="center"><a target="_blank" href="https://openlist.nn.ci/zh/" > © Powered by OpenList</a><span> | </span><a target="_blank" href="/@manage" >管理</a></p></div></div><script>let interval = setInterval(() => {if (document.querySelector(".footer")) {document.querySelector("#customize").style.display = "";clearInterval(interval);}}, 200);<\/script><script>var xhttp = new XMLHttpRequest();xhttp.open("GET", "${txt_file_url}", true);xhttp.onreadystatechange = function() {if (this.readyState == 4 && this.status == 200) {var text = this.responseText;document.getElementById("content").innerHTML = text;}};xhttp.send();<\/script></head></html>
+    CUSTOM_HTML_SNIPPET=$(cat <<EOF
+<div id="customize" style="display: none;">
+    <div id="disk-info" style="text-align: center; margin: 10px 0; color: #666;"></div>
+    <style>
+        .footer span, .footer a:nth-of-type(1), .footer a:nth-of-type(2) {
+            display: none;
+        }
+        .hope-stack.hope-c-dhzjXW.hope-c-PJLV.hope-c-PJLV-ihYBJPK-css {
+            display: none !important;
+        }
+    </style>
+    <div style="text-align: center;">
+        <p>
+            <a target="_blank" href="https://openlist.nn.ci/zh/">© Powered by OpenList</a>
+            <span>|</span>
+            <a target="_blank" href="/@manage">管理</a>
+        </p>
+    </div>
+</div>
+
+<script>
+    let interval = setInterval(() => {
+        if (document.querySelector(".footer")) {
+            document.querySelector("#customize").style.display = "";
+            fetch('/d/本地磁盘空间.txt?v=' + new Date().getTime()) // 添加时间戳防止缓存
+                .then(response => response.text())
+                .then(text => {
+                    document.getElementById("disk-info").innerHTML = text;
+                });
+            clearInterval(interval);
+        }
+    }, 200);
+</script>
 EOF
 )
-    # 停止 OpenList 以安全地修改配置
-    systemctl stop openlist
-
-    # 读取旧配置，删除结尾的 `}`，添加新内容，再加回 `}`
-    # 这是一个比较稳定的方法，可以避免破坏JSON结构
-    head -n -1 /app/openlist/data/config.json > /tmp/config.tmp
-    echo "," >> /tmp/config.tmp
-    echo '  "custom_body": "'"$custom_html"'"' >> /tmp/config.tmp
-    echo "}" >> /tmp/config.tmp
-    mv /tmp/config.tmp /app/openlist/data/config.json
-    
-    chown openlist:openlist /app/openlist/data/config.json
-    systemctl start openlist
-    
-    echo -e "${GREEN}美化设置已应用。${PLAIN}"
 }
 
-# --- 主程序 ---
+# 脚本主流程
+#----------------------------------------------------
 main() {
-    clear
-    echo -e "=============================================================="
-    echo -e "         OpenList 全自动安装与配置脚本"
-    echo -e "=============================================================="
-
-    get_user_input
+    ask_for_domain
     install_dependencies
     install_openlist
-    configure_nginx_ssl
+    setup_nginx_reverse_proxy
     setup_beautification
-
-    # 清理
-    rm -f /app/check_space.sh
-
+    
     # 显示最终信息
-    echo -e "=============================================================="
-    echo -e "${GREEN}祝贺您！OpenList 已成功安装并配置完毕！${PLAIN}"
-    echo -e "--------------------------------------------------------------"
-    echo -e "访问地址:   ${YELLOW}https://$DOMAIN${PLAIN}"
-    echo -e "内部端口:   ${YELLOW}$OPENLIST_PORT${PLAIN}"
-    echo -e "用 户 名:   ${YELLOW}admin${PLAIN}"
-    echo -e "初始密码:   ${RED}$ADMIN_PASSWORD${PLAIN}"
-    echo -e "--------------------------------------------------------------"
-    echo -e "${YELLOW}请立即登录并修改您的初始密码。${PLAIN}"
-    echo -e "${YELLOW}磁盘容量信息可能需要一分钟左右才会首次显示。${PLAIN}"
-    echo -e "=============================================================="
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "${GREEN}           🎉 OpenList 安装配置完成！ 🎉          ${NC}"
+    echo -e "${BLUE}=====================================================${NC}"
+    echo -e "访问地址:   ${YELLOW}https://${PRIMARY_DOMAIN}${NC}"
+    echo -e "内部端口:   ${YELLOW}${LISTEN_PORT}${NC}"
+    echo -e "用 户 名:   ${YELLOW}admin${NC}"
+    echo -e "初始密码:   ${RED}${INITIAL_PASSWORD}${NC}"
+    echo -e "${BLUE}-----------------------------------------------------${NC}"
+    echo -e "${YELLOW}重要操作提示:${NC}"
+    echo -e "1. 登录后请立即修改您的密码。"
+    echo -e "2. 请到OpenList [设置]>[存储]>[添加]，类型选择[本地存储]，[根文件夹路径]填写: ${GREEN}/html/网盘${NC}"
+    echo -e "3. 复制以下代码到OpenList [设置]>[全局]>[自定义内容] 中，以实现磁盘容量显示和页脚美化:"
+    echo -e "${BLUE}--------------------- 复制以下代码 --------------------${NC}"
+    echo -e "${CUSTOM_HTML_SNIPPET}"
+    echo -e "${BLUE}-----------------------------------------------------${NC}"
+    echo -e "管理命令:"
+    echo -e "  - 启动 OpenList: ${GREEN}systemctl start openlist${NC}"
+    echo -e "  - 停止 OpenList: ${GREEN}systemctl stop openlist${NC}"
+    echo -e "  - 查看状态:      ${GREEN}systemctl status openlist${NC}"
+    echo -e "  - 重启 Nginx:    ${GREEN}systemctl restart nginx${NC}"
+    echo -e "${BLUE}=====================================================${NC}"
+
 }
 
+# 执行主函数
 main
