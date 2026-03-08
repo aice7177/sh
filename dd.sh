@@ -918,6 +918,48 @@ d-i finish-install/reboot_in_progress note
 }
 
 # =============================================================================
+# 第五阶段 B：将 preseed 打包进 initrd
+# =============================================================================
+# Debian installer 运行在自己的 initrd 环境中，无法访问宿主系统的硬盘文件。
+# 因此必须将 preseed.cfg 嵌入 initrd.gz 内部，installer 才能读取到。
+# 方法：用 cpio 追加 preseed.cfg 到 initrd.gz 末尾（CPIO 支持多段拼接）。
+repack_initrd() {
+    log_step "将 preseed.cfg 嵌入 initrd.gz"
+
+    # 确保 cpio 可用
+    if ! require_cmd cpio; then
+        apt-get install -y -qq cpio || die "无法安装 cpio"
+    fi
+
+    local initrd_file="${NETBOOT_DIR}/initrd.gz"
+    local preseed_src="${PRESEED_FILE}"
+
+    # 备份原始 initrd
+    cp "$initrd_file" "${initrd_file}.orig"
+    log_info "已备份原始 initrd → ${initrd_file}.orig"
+
+    # 创建临时工作目录
+    local tmpdir
+    tmpdir=$(mktemp -d "${NETBOOT_DIR}/repack.XXXXXX")
+
+    # 将 preseed.cfg 复制到临时目录根（installer 期望在 /preseed.cfg）
+    cp "$preseed_src" "${tmpdir}/preseed.cfg"
+
+    # 用 cpio 生成追加段，gzip 压缩后拼接到 initrd.gz 末尾
+    # Linux initrd 支持多段 cpio 拼接，内核会依次解包
+    (
+        cd "$tmpdir" || die "无法进入临时目录"
+        echo "preseed.cfg" | cpio -o -H newc 2>/dev/null | gzip >> "$initrd_file"
+    ) || die "将 preseed.cfg 嵌入 initrd 失败"
+
+    # 清理临时目录
+    rm -rf "$tmpdir"
+
+    log_info "preseed.cfg 已嵌入 initrd.gz ✓"
+    log_info "  内核参数将使用: preseed/file=/preseed.cfg"
+}
+
+# =============================================================================
 # 第六阶段：配置 GRUB
 # =============================================================================
 configure_grub() {
@@ -948,7 +990,7 @@ configure_grub() {
 
     # 基础安装器参数
     kernel_params+="auto=true priority=critical"
-    kernel_params+=" preseed/file=/boot/debian-netboot/preseed.cfg"
+    kernel_params+=" preseed/file=/preseed.cfg"
     kernel_params+=" locale=en_US.UTF-8"
     kernel_params+=" keymap=us"
     kernel_params+=" hostname=${HOSTNAME_NEW}"
@@ -1193,6 +1235,9 @@ main() {
 
     # 阶段五：生成 preseed
     generate_preseed
+
+    # 阶段五 B：将 preseed 嵌入 initrd
+    repack_initrd
 
     # 阶段六：GRUB
     configure_grub
