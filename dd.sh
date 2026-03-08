@@ -616,30 +616,76 @@ verify_checksum() {
     local linux_expected initrd_expected
     local netboot_path="netboot/debian-installer/amd64"
 
-    linux_expected=$(grep "${netboot_path}/linux" SHA256SUMS | awk '{print $1}') || true
-    initrd_expected=$(grep "${netboot_path}/initrd.gz" SHA256SUMS | awk '{print $1}') || true
+    # 显示 SHA256SUMS 中所有 netboot 相关条目（诊断用）
+    log_info "SHA256SUMS 中匹配 '${netboot_path}' 的条目:"
+    grep "${netboot_path}" SHA256SUMS >&2 || log_warn "  (无匹配条目)"
 
-    # 如果精确路径未匹配（可能 Debian 版本间路径有差异），显示可用条目让用户判断
-    if [[ -z "$linux_expected" || -z "$initrd_expected" ]]; then
-        log_warn "未能按路径 '${netboot_path}/' 匹配到条目"
-        log_warn "SHA256SUMS 中包含以下 linux/initrd.gz 条目:"
-        grep -E '(linux|initrd\.gz)' SHA256SUMS >&2 || true
-        die "无法从 SHA256SUMS 中提取 netboot 文件的校验值。请手动检查 ${NETBOOT_DIR}/SHA256SUMS"
-    fi
-
-    log_info "匹配到的校验值:"
-    log_info "  linux:     ${linux_expected}"
-    log_info "  initrd.gz: ${initrd_expected}"
+    linux_expected=$(grep -E "${netboot_path}/linux$" SHA256SUMS | head -1 | awk '{print $1}') || true
+    initrd_expected=$(grep -E "${netboot_path}/initrd\.gz$" SHA256SUMS | head -1 | awk '{print $1}') || true
 
     local linux_actual initrd_actual
     linux_actual=$(sha256sum vmlinuz | awk '{print $1}')
     initrd_actual=$(sha256sum initrd.gz | awk '{print $1}')
 
-    if [[ "$linux_actual" != "$linux_expected" ]]; then
-        die "linux 文件校验失败！\n  预期: $linux_expected\n  实际: $linux_actual"
+    log_info "校验对比:"
+    log_info "  linux   — SHA256SUMS: ${linux_expected:-(未找到)}"
+    log_info "  linux   — 实际文件:   ${linux_actual}"
+    log_info "  initrd  — SHA256SUMS: ${initrd_expected:-(未找到)}"
+    log_info "  initrd  — 实际文件:   ${initrd_actual}"
+
+    local failed=0
+
+    # 检查是否找到了条目
+    if [[ -z "$linux_expected" || -z "$initrd_expected" ]]; then
+        log_warn "SHA256SUMS 中未找到 netboot 路径的条目"
+        log_warn "SHA256SUMS 中所有 linux/initrd 条目如下:"
+        grep -E '(linux|initrd)' SHA256SUMS >&2 || true
+        failed=1
     fi
-    if [[ "$initrd_actual" != "$initrd_expected" ]]; then
-        die "initrd.gz 文件校验失败！\n  预期: $initrd_expected\n  实际: $initrd_actual"
+
+    # 比较哈希
+    if [[ "$failed" -eq 0 ]]; then
+        if [[ "$linux_actual" != "$linux_expected" ]]; then
+            log_error "linux 校验不匹配！"
+            failed=1
+        fi
+        if [[ "$initrd_actual" != "$initrd_expected" ]]; then
+            log_error "initrd.gz 校验不匹配！"
+            failed=1
+        fi
+    fi
+
+    if [[ "$failed" -eq 0 ]]; then
+        cd - &>/dev/null
+        return 0
+    fi
+
+    # 校验失败 — 给用户完整信息和选择
+    echo "" >&2
+    echo "╔══════════════════════════════════════════════════════════════╗" >&2
+    echo "║  ⚠  SHA256 校验未通过                                       ║" >&2
+    echo "╠══════════════════════════════════════════════════════════════╣" >&2
+    echo "║                                                            ║" >&2
+    echo "║  可能原因:                                                  ║" >&2
+    echo "║  1. 镜像正在同步（尤其 trixie/testing 经常发生）            ║" >&2
+    echo "║  2. SHA256SUMS 和实际文件版本不一致                         ║" >&2
+    echo "║  3. 下载过程中文件损坏                                      ║" >&2
+    echo "║                                                            ║" >&2
+    echo "║  建议:                                                      ║" >&2
+    echo "║  • 等几分钟后重新运行脚本                                   ║" >&2
+    echo "║  • 或检查 ${NETBOOT_DIR}/SHA256SUMS 内容                    ║" >&2
+    echo "║  • 手动运行: sha256sum ${NETBOOT_DIR}/initrd.gz             ║" >&2
+    echo "║                                                            ║" >&2
+    echo "╚══════════════════════════════════════════════════════════════╝" >&2
+    echo "" >&2
+    echo "你可以选择:" >&2
+    echo "  1. 中止脚本（推荐，稍后重试）" >&2
+    echo "  2. 忽略校验错误继续（有风险，文件可能不完整）" >&2
+    read -rp "请输入 1 或 2 [默认 1]: " verify_choice
+    if [[ "$verify_choice" == "2" ]]; then
+        log_warn "用户选择忽略校验错误，继续执行"
+    else
+        die "校验失败，用户选择中止。请稍后重新运行脚本。"
     fi
 
     cd - &>/dev/null
