@@ -610,22 +610,26 @@ download_file() {
 verify_checksum() {
     cd "$NETBOOT_DIR" || die "无法进入 $NETBOOT_DIR"
 
-    # SHA256SUMS 中路径格式类似 ./netboot/debian-installer/amd64/linux
-    # 我们需要匹配 linux 和 initrd.gz
+    # SHA256SUMS 包含所有安装镜像（cdrom、hd-media、netboot 等）的校验值
+    # 路径格式: ./netboot/debian-installer/amd64/linux
+    # 必须精确匹配 netboot 路径，否则会拿到其他镜像的校验值
     local linux_expected initrd_expected
+    local netboot_path="netboot/debian-installer/amd64"
 
-    linux_expected=$(grep -E '(^|/)linux$' SHA256SUMS | head -1 | awk '{print $1}') || true
-    initrd_expected=$(grep -E '(^|/)initrd\.gz$' SHA256SUMS | head -1 | awk '{print $1}') || true
+    linux_expected=$(grep "${netboot_path}/linux" SHA256SUMS | awk '{print $1}') || true
+    initrd_expected=$(grep "${netboot_path}/initrd.gz" SHA256SUMS | awk '{print $1}') || true
 
+    # 如果精确路径未匹配（可能 Debian 版本间路径有差异），显示可用条目让用户判断
     if [[ -z "$linux_expected" || -z "$initrd_expected" ]]; then
-        log_warn "SHA256SUMS 中未找到精确匹配条目，尝试宽松匹配 ..."
-        linux_expected=$(grep 'linux' SHA256SUMS | grep -v initrd | head -1 | awk '{print $1}') || true
-        initrd_expected=$(grep 'initrd.gz' SHA256SUMS | head -1 | awk '{print $1}') || true
+        log_warn "未能按路径 '${netboot_path}/' 匹配到条目"
+        log_warn "SHA256SUMS 中包含以下 linux/initrd.gz 条目:"
+        grep -E '(linux|initrd\.gz)' SHA256SUMS >&2 || true
+        die "无法从 SHA256SUMS 中提取 netboot 文件的校验值。请手动检查 ${NETBOOT_DIR}/SHA256SUMS"
     fi
 
-    if [[ -z "$linux_expected" || -z "$initrd_expected" ]]; then
-        die "无法从 SHA256SUMS 中提取校验值。请手动检查 ${NETBOOT_DIR}/SHA256SUMS"
-    fi
+    log_info "匹配到的校验值:"
+    log_info "  linux:     ${linux_expected}"
+    log_info "  initrd.gz: ${initrd_expected}"
 
     local linux_actual initrd_actual
     linux_actual=$(sha256sum vmlinuz | awk '{print $1}')
