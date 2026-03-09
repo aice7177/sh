@@ -1,1256 +1,787 @@
 #!/usr/bin/env bash
-###############################################################################
-# debian-netboot-prepare.sh
-#
-# 一键准备 Debian netboot 重装环境（非全自动安装）
-#   - 自动检测环境（BIOS/UEFI、网络、依赖）
-#   - 交互选择 Debian 12 bookworm / 13 trixie
-#   - 交互配置网络（IPv4/IPv6）、账户、SSH、内核
-#   - 下载并校验 netboot 内核与 initrd
-#   - 生成 preseed 文件
-#   - 写入 GRUB 菜单项（仅下一次启动生效）
-#   - 重启前显示完整摘要并二次确认
-#
-# 用法:  sudo bash debian-netboot-prepare.sh
-#
-# 风险提示:
-#   1. 本脚本会修改 /etc/grub.d/40_custom 并执行 update-grub
-#   2. 使用 grub-reboot 设置一次性启动
-#   3. 重启后将进入 Debian 安装器（通过 VNC 手动完成安装）
-#   4. 分区和最终 bootloader 安装目标由用户在 VNC 中手动决定
-#
-# 取消下次启动进入安装器:
-#   sudo grub-reboot 0
-#   # 或删除 /etc/grub.d/40_custom 中的 netboot 条目后 sudo update-grub
-###############################################################################
-
+#===============================================================================
+#  Debian Netboot 一键重装脚本
+#  功能：通过 GRUB 引导 Debian netboot 安装器，支持 BIOS/UEFI 自动检测
+#  用途：重启后通过 VNC 手动完成安装
+#===============================================================================
 set -euo pipefail
 
-# =============================================================================
-# 全局常量
-# =============================================================================
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
-readonly NETBOOT_DIR="/boot/debian-netboot"
-readonly PRESEED_FILE="/boot/debian-netboot/preseed.cfg"
-readonly GRUB_CUSTOM="/etc/grub.d/40_custom"
-readonly GRUB_CUSTOM_BACKUP="/etc/grub.d/40_custom.bak.$(date +%Y%m%d%H%M%S)"
-readonly GRUB_MENUENTRY_ID="debian-netboot-installer"
-readonly LOG_FILE="/var/log/debian-netboot-prepare.log"
+#——————————————————————————————————————————————
+# 全局变量 / 默认值
+#——————————————————————————————————————————————
+NETBOOT_DIR="/netboot"
+PRESEED_FILE="${NETBOOT_DIR}/preseed.cfg"
+GRUB_CUSTOM="/etc/grub.d/40_custom"
+GRUB_CUSTOM_BACKUP="/etc/grub.d/40_custom.bak.$(date +%s)"
+DEBIAN_VERSION="bookworm"
+DEBIAN_ARCH="amd64"
 
-# Debian 镜像基础 URL（优先 HTTPS）
-readonly DEB12_BASE="https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images/netboot/debian-installer/amd64"
-readonly DEB13_BASE="https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64"
-# 校验文件 URL
-readonly DEB12_SUMS_BASE="https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images"
-readonly DEB13_SUMS_BASE="https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images"
+# Debian 官方镜像源列表（用户可选）
+declare -A MIRRORS=(
+    ["1-官方(美国)"]="http://http.us.debian.org/debian"
+    ["2-清华大学(中国)"]="https://mirrors.tuna.tsinghua.edu.cn/debian"
+    ["3-中科大(中国)"]="https://mirrors.ustc.edu.cn/debian"
+    ["4-阿里云(中国)"]="https://mirrors.aliyun.com/debian"
+    ["5-华为云(中国)"]="https://repo.huaweicloud.com/debian"
+    ["6-官方(欧洲-德国)"]="http://ftp.de.debian.org/debian"
+    ["7-官方(日本)"]="http://ftp.jp.debian.org/debian"
+)
 
-# =============================================================================
-# 用户选择变量（脚本运行时填充）
-# =============================================================================
-DEBIAN_VERSION=""       # 12 或 13
-DEBIAN_CODENAME=""      # bookworm 或 trixie
-BOOT_MODE=""            # bios 或 uefi
-DOWNLOAD_TOOL=""        # wget 或 curl
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
 
-# 网络配置
-NET_MODE=""             # ipv4 / ipv6 / dual
-NET_IFACE=""
-IPV4_ADDR="" ; IPV4_GW="" ; IPV4_MASK="" ; IPV4_PREFIX=""
-IPV6_ADDR="" ; IPV6_GW="" ; IPV6_PREFIX=""
-DNS_SERVERS=""
-HOSTNAME_NEW=""
+#——————————————————————————————————————————————
+# 工具函数
+#——————————————————————————————————————————————
+msg_info()  { echo -e "${CYAN}[信息]${NC} $*"; }
+msg_ok()    { echo -e "${GREEN}[完成]${NC} $*"; }
+msg_warn()  { echo -e "${YELLOW}[警告]${NC} $*"; }
+msg_error() { echo -e "${RED}[错误]${NC} $*"; }
+msg_step()  { echo -e "\n${BOLD}========== $* ==========${NC}"; }
 
-# 账户
-USER_STRATEGY=""        # root_only / create_user
-NORMAL_USER=""
-ROOT_PW_HASH=""
-USER_PW_HASH=""
+confirm_or_exit() {
+    local prompt="${1:-是否继续？}"
+    read -rp "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]] || { msg_warn "用户取消操作，退出。"; exit 0; }
+}
 
-# SSH
-SSH_PORT="22"
-SSH_PUBKEYS=""
-SSH_ROOT_POLICY=""      # pubkey_only / password_allowed
-
-# 内核
-INSTALL_CLOUD_KERNEL="" # yes / no
-ENABLE_BACKPORTS=""     # yes / no (仅 Debian 12)
-
-# =============================================================================
-# 日志函数
-# =============================================================================
-log_info()  { echo -e "\033[32m[INFO]\033[0m  $*"; echo "[INFO]  $(date '+%F %T') $*" >> "$LOG_FILE"; }
-log_warn()  { echo -e "\033[33m[WARN]\033[0m  $*"; echo "[WARN]  $(date '+%F %T') $*" >> "$LOG_FILE"; }
-log_error() { echo -e "\033[31m[ERROR]\033[0m $*"; echo "[ERROR] $(date '+%F %T') $*" >> "$LOG_FILE"; }
-log_step()  { echo ""; echo -e "\033[36m========== $* ==========\033[0m"; echo "[STEP]  $(date '+%F %T') $*" >> "$LOG_FILE"; }
-
-die() {
-    log_error "$*"
-    echo ""
-    echo "脚本已终止。请检查上面的错误信息。"
+cleanup_on_error() {
+    msg_error "脚本执行出错，正在回滚..."
+    # 恢复 GRUB 配置
+    if [[ -f "${GRUB_CUSTOM_BACKUP}" ]]; then
+        cp -f "${GRUB_CUSTOM_BACKUP}" "${GRUB_CUSTOM}"
+        update-grub 2>/dev/null || true
+        msg_info "已恢复 GRUB 配置"
+    fi
+    # 清理下载文件
+    if [[ -d "${NETBOOT_DIR}" ]]; then
+        rm -rf "${NETBOOT_DIR}"
+        msg_info "已清理 ${NETBOOT_DIR}"
+    fi
+    msg_error "回滚完成，系统未被修改。"
     exit 1
 }
 
-# =============================================================================
-# 辅助函数
-# =============================================================================
+trap cleanup_on_error ERR
 
-# 带默认值的交互输入
-# 注意：显示内容走 stderr，只有返回值走 stdout（供 $() 捕获）
-prompt_with_default() {
-    local prompt="$1"
-    local default="$2"
-    local result
-    if [[ -n "$default" ]]; then
-        read -rp "${prompt} [${default}]: " result
-        echo "${result:-$default}"
-    else
-        read -rp "${prompt}: " result
-        echo "$result"
+#——————————————————————————————————————————————
+# 第 1 步：环境检查
+#——————————————————————————————————————————————
+preflight_check() {
+    msg_step "第 1 步：环境检查"
+
+    # 1.1 root 权限
+    if [[ $EUID -ne 0 ]]; then
+        msg_error "请使用 root 用户运行此脚本！"
+        msg_info "用法: sudo bash $0"
+        exit 1
     fi
-}
+    msg_ok "root 权限确认"
 
-# 带重试的必填输入
-prompt_required() {
-    local prompt="$1"
-    local result=""
-    while [[ -z "$result" ]]; do
-        read -rp "${prompt}: " result
-        [[ -z "$result" ]] && echo "  ⚠ 此项不能为空，请重新输入。" >&2
-    done
-    echo "$result"
-}
-
-# 选择菜单（返回选项编号）
-# 菜单和错误提示走 stderr，只有最终编号走 stdout
-prompt_choice() {
-    local prompt="$1"
-    shift
-    local options=("$@")
-    local choice=""
-    while true; do
-        echo "$prompt" >&2
-        for i in "${!options[@]}"; do
-            echo "  $((i+1)). ${options[$i]}" >&2
-        done
-        read -rp "请输入编号 [1-${#options[@]}]: " choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
-            echo "$choice"
-            return 0
-        fi
-        echo "  ⚠ 无效选择，请重新输入。" >&2
-    done
-}
-
-# 安全密码输入（带确认）
-# 提示和错误走 stderr，只有最终哈希走 stdout
-prompt_password() {
-    local label="$1"
-    local pw1 pw2
-    while true; do
-        read -rsp "请输入 ${label} 密码: " pw1; echo "" >&2
-        if [[ -z "$pw1" ]]; then
-            echo "  ⚠ 密码不能为空。" >&2
-            continue
-        fi
-        if [[ ${#pw1} -lt 8 ]]; then
-            echo "  ⚠ 密码长度建议至少 8 位，当前 ${#pw1} 位。确定使用？(y/N)" >&2
-            local confirm
-            read -r confirm
-            if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-                continue
-            fi
-        fi
-        read -rsp "请再次输入 ${label} 密码: " pw2; echo "" >&2
-        if [[ "$pw1" == "$pw2" ]]; then
-            # 使用 mkpasswd 或 openssl 生成 SHA-512 哈希
-            local hash
-            if command -v mkpasswd &>/dev/null; then
-                hash=$(mkpasswd -m sha-512 "$pw1")
-            elif command -v openssl &>/dev/null; then
-                local salt
-                salt=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
-                hash=$(openssl passwd -6 -salt "$salt" "$pw1")
-            else
-                die "无法找到 mkpasswd 或 openssl 来生成密码哈希"
-            fi
-            # 清除明文（bash 中无法完全保证，但至少不保留在变量中）
-            pw1=""; pw2=""
-            echo "$hash"
-            return 0
-        fi
-        echo "  ⚠ 两次密码不一致，请重新输入。" >&2
-    done
-}
-
-# 检查命令是否存在
-require_cmd() {
-    command -v "$1" &>/dev/null || return 1
-}
-
-# =============================================================================
-# 第一阶段：前置检查
-# =============================================================================
-check_root() {
-    [[ $EUID -eq 0 ]] || die "请使用 root 权限运行本脚本：sudo bash $SCRIPT_NAME"
-}
-
-check_os() {
+    # 1.2 操作系统检查
     if [[ ! -f /etc/debian_version ]]; then
-        die "本脚本仅支持在 Debian/Ubuntu 系统上运行（未找到 /etc/debian_version）"
+        msg_error "此脚本仅支持 Debian 系统！"
+        exit 1
     fi
-    log_info "当前系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+    local current_ver
+    current_ver=$(cat /etc/debian_version)
+    msg_ok "当前系统: Debian ${current_ver}"
+
+    # 1.3 必要工具检查
+    local required_tools=("wget" "grub-mkconfig" "blkid" "findmnt" "ip" "sha256sum" "gpgv")
+    local missing_tools=()
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        msg_warn "缺少以下工具: ${missing_tools[*]}"
+        msg_info "正在尝试安装..."
+        apt-get update -qq
+        apt-get install -y -qq wget grub2-common util-linux iproute2 coreutils gpgv debian-keyring 2>/dev/null || {
+            msg_error "无法安装必要工具，请手动安装后重试。"
+            exit 1
+        }
+    fi
+    msg_ok "必要工具已就绪"
+
+    # 1.4 网络连通性
+    if ! wget -q --spider --timeout=10 http://http.us.debian.org 2>/dev/null; then
+        msg_warn "无法连接到默认 Debian 镜像源，请确保网络可用或选择其他镜像源。"
+    else
+        msg_ok "网络连通正常"
+    fi
+
+    # 1.5 VNC 提醒
+    echo ""
+    msg_warn "======================================================"
+    msg_warn "  重要提醒：重启后 SSH 将不可用！"
+    msg_warn "  请确保你可以通过 VNC 控制台访问服务器！"
+    msg_warn "  如果无法使用 VNC，请不要继续！"
+    msg_warn "======================================================"
+    echo ""
+    confirm_or_exit "你是否已确认可以通过 VNC 访问此服务器？"
 }
 
+#——————————————————————————————————————————————
+# 第 2 步：检测引导方式（BIOS / UEFI）
+#——————————————————————————————————————————————
+BOOT_MODE=""
 detect_boot_mode() {
+    msg_step "第 2 步：检测引导方式"
+
     if [[ -d /sys/firmware/efi ]]; then
-        BOOT_MODE="uefi"
-    else
-        BOOT_MODE="bios"
-    fi
-    log_info "启动模式: ${BOOT_MODE^^}"
-}
-
-detect_download_tool() {
-    if require_cmd wget; then
-        DOWNLOAD_TOOL="wget"
-    elif require_cmd curl; then
-        DOWNLOAD_TOOL="curl"
-    else
-        DOWNLOAD_TOOL=""
-    fi
-}
-
-install_dependencies() {
-    log_step "安装必要依赖"
-
-    local pkgs_to_install=()
-
-    # wget 或 curl 至少需要一个
-    if ! require_cmd wget && ! require_cmd curl; then
-        pkgs_to_install+=(wget)
-    fi
-
-    # grub 工具
-    if ! require_cmd update-grub; then
-        if [[ "$BOOT_MODE" == "uefi" ]]; then
-            pkgs_to_install+=(grub-efi-amd64)
-        else
-            pkgs_to_install+=(grub-pc)
+        BOOT_MODE="UEFI"
+        msg_ok "引导方式: UEFI"
+        # 检查 EFI 分区
+        if ! findmnt /boot/efi &>/dev/null && ! findmnt /efi &>/dev/null; then
+            msg_warn "未检测到已挂载的 EFI 分区，UEFI 引导可能有问题。"
         fi
-    fi
-
-    # grub-reboot 需要 grub-common（通常已装）
-    if ! require_cmd grub-reboot; then
-        pkgs_to_install+=(grub-common)
-    fi
-
-    # mkpasswd（在 whois 包中）或 openssl
-    if ! require_cmd mkpasswd && ! require_cmd openssl; then
-        pkgs_to_install+=(whois)
-    fi
-
-    if (( ${#pkgs_to_install[@]} > 0 )); then
-        log_info "需要安装: ${pkgs_to_install[*]}"
-        apt-get update -qq || die "apt-get update 失败"
-        apt-get install -y -qq "${pkgs_to_install[@]}" || die "依赖安装失败: ${pkgs_to_install[*]}"
     else
-        log_info "所有依赖已满足"
+        BOOT_MODE="BIOS"
+        msg_ok "引导方式: BIOS (Legacy)"
     fi
-
-    # 重新检测下载工具
-    detect_download_tool
-    [[ -n "$DOWNLOAD_TOOL" ]] || die "下载工具不可用（需要 wget 或 curl）"
-    log_info "下载工具: $DOWNLOAD_TOOL"
-
-    # 最终验证关键命令
-    require_cmd update-grub || die "update-grub 不可用"
-    require_cmd grub-reboot || die "grub-reboot 不可用"
 }
 
-# =============================================================================
-# 第二阶段：检测网络
-# =============================================================================
+#——————————————————————————————————————————————
+# 第 3 步：获取网络配置
+#——————————————————————————————————————————————
+NET_IFACE=""
+NET_IP=""
+NET_MASK=""
+NET_CIDR=""
+NET_GW=""
+NET_DNS1=""
+NET_DNS2=""
+NET_IP6=""
+NET_GW6=""
+HAS_IPV6="no"
+
 detect_network() {
-    log_step "检测当前网络配置"
+    msg_step "第 3 步：获取当前网络配置"
 
-    # 检测默认网卡
-    NET_IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' || true)
+    # 检测主网卡（默认路由使用的接口）
+    NET_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
     if [[ -z "$NET_IFACE" ]]; then
-        # 尝试 IPv6
-        NET_IFACE=$(ip -o -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' || true)
+        msg_error "无法检测到默认网络接口！"
+        read -rp "请手动输入网卡名称（如 eth0, ens3）: " NET_IFACE
     fi
-    if [[ -z "$NET_IFACE" ]]; then
-        # 最后尝试第一个非 lo 接口
-        NET_IFACE=$(ip -o link show | awk -F': ' '!/lo/{print $2; exit}' | tr -d ' ')
+    msg_ok "主网卡: ${NET_IFACE}"
+
+    # IPv4 配置
+    NET_IP=$(ip -4 addr show dev "$NET_IFACE" | grep -oP 'inet \K[\d.]+' | head -1)
+    NET_CIDR=$(ip -4 addr show dev "$NET_IFACE" | grep -oP 'inet \K[\d./]+' | head -1 | cut -d/ -f2)
+    NET_GW=$(ip -4 route show default | awk '{print $3}' | head -1)
+
+    # 子网掩码转换（CIDR -> 点分十进制）
+    cidr_to_netmask() {
+        local cidr=$1
+        local mask=""
+        local full_octets=$((cidr / 8))
+        local partial_bits=$((cidr % 8))
+        for ((i=0; i<4; i++)); do
+            if [[ $i -lt $full_octets ]]; then
+                mask+="255"
+            elif [[ $i -eq $full_octets ]]; then
+                mask+="$(( 256 - (1 << (8 - partial_bits)) ))"
+            else
+                mask+="0"
+            fi
+            [[ $i -lt 3 ]] && mask+="."
+        done
+        echo "$mask"
+    }
+    NET_MASK=$(cidr_to_netmask "$NET_CIDR")
+
+    # DNS（从 resolv.conf 获取）
+    NET_DNS1=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
+    NET_DNS2=$(grep '^nameserver' /etc/resolv.conf | awk 'NR==2{print $2}')
+    [[ -z "$NET_DNS1" ]] && NET_DNS1="8.8.8.8"
+    [[ -z "$NET_DNS2" ]] && NET_DNS2="1.1.1.1"
+
+    # IPv6 检测
+    local ipv6_addr
+    ipv6_addr=$(ip -6 addr show dev "$NET_IFACE" scope global | grep -oP 'inet6 \K[0-9a-f:]+' | head -1)
+    if [[ -n "$ipv6_addr" ]]; then
+        HAS_IPV6="yes"
+        NET_IP6="$ipv6_addr"
+        NET_GW6=$(ip -6 route show default | awk '{print $3}' | head -1)
     fi
-    [[ -n "$NET_IFACE" ]] || die "无法检测到网络接口"
-    log_info "网络接口: $NET_IFACE"
 
-    # IPv4
-    IPV4_ADDR=$(ip -4 addr show dev "$NET_IFACE" 2>/dev/null | awk '/inet /{print $2}' | head -1 | cut -d/ -f1 || true)
-    IPV4_PREFIX=$(ip -4 addr show dev "$NET_IFACE" 2>/dev/null | awk '/inet /{print $2}' | head -1 | cut -d/ -f2 || true)
-    IPV4_GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}' || true)
-
-    # 将 CIDR 前缀转为子网掩码
-    if [[ -n "$IPV4_PREFIX" ]]; then
-        IPV4_MASK=$(python3 -c "
-import ipaddress, sys
-try:
-    n = ipaddress.IPv4Network('0.0.0.0/${IPV4_PREFIX}')
-    print(str(n.netmask))
-except Exception:
-    print('')
-" 2>/dev/null || true)
-    fi
-
-    # IPv6（排除 link-local fe80::）
-    IPV6_ADDR=$(ip -6 addr show dev "$NET_IFACE" scope global 2>/dev/null | awk '/inet6/{print $2}' | head -1 | cut -d/ -f1 || true)
-    IPV6_PREFIX=$(ip -6 addr show dev "$NET_IFACE" scope global 2>/dev/null | awk '/inet6/{print $2}' | head -1 | cut -d/ -f2 || true)
-    IPV6_GW=$(ip -6 route show default 2>/dev/null | awk '{print $3; exit}' || true)
-
-    # DNS
-    DNS_SERVERS=$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null | xargs || true)
-    if [[ -z "$DNS_SERVERS" ]]; then
-        DNS_SERVERS="8.8.8.8 8.8.4.4"
-    fi
-
-    # Hostname
-    HOSTNAME_NEW=$(hostname 2>/dev/null || echo "debian")
-
+    # 显示检测到的配置
     echo ""
-    echo "╔══════════════════════════════════════════╗"
-    echo "║        当前检测到的网络配置               ║"
-    echo "╠══════════════════════════════════════════╣"
-    echo "║ 网络接口:  $NET_IFACE"
-    echo "║ IPv4 地址: ${IPV4_ADDR:-(未检测到)}"
-    echo "║ IPv4 掩码: ${IPV4_MASK:-(未检测到)}  (/${IPV4_PREFIX:-?})"
-    echo "║ IPv4 网关: ${IPV4_GW:-(未检测到)}"
-    echo "║ IPv6 地址: ${IPV6_ADDR:-(未检测到)}"
-    echo "║ IPv6 前缀: ${IPV6_PREFIX:-(未检测到)}"
-    echo "║ IPv6 网关: ${IPV6_GW:-(未检测到)}"
-    echo "║ DNS:       ${DNS_SERVERS:-(未检测到)}"
-    echo "║ Hostname:  ${HOSTNAME_NEW}"
-    echo "╚══════════════════════════════════════════╝"
-    echo ""
-}
-
-# =============================================================================
-# 第三阶段：用户交互配置
-# =============================================================================
-
-choose_debian_version() {
-    log_step "选择 Debian 版本"
-    local c
-    c=$(prompt_choice "请选择要安装的 Debian 版本:" "Debian 12 (bookworm) — 当前稳定版" "Debian 13 (trixie) — 当前测试版")
-    if [[ "$c" == "1" ]]; then
-        DEBIAN_VERSION="12"
-        DEBIAN_CODENAME="bookworm"
+    msg_info "————— 检测到的网络配置 —————"
+    msg_info "网卡接口:   ${NET_IFACE}"
+    msg_info "IPv4 地址:  ${NET_IP}/${NET_CIDR}"
+    msg_info "子网掩码:   ${NET_MASK}"
+    msg_info "默认网关:   ${NET_GW}"
+    msg_info "DNS 1:      ${NET_DNS1}"
+    msg_info "DNS 2:      ${NET_DNS2}"
+    if [[ "$HAS_IPV6" == "yes" ]]; then
+        msg_info "IPv6 地址:  ${NET_IP6}"
+        msg_info "IPv6 网关:  ${NET_GW6}"
     else
-        DEBIAN_VERSION="13"
-        DEBIAN_CODENAME="trixie"
+        msg_info "IPv6:       未检测到"
     fi
-    log_info "已选择: Debian ${DEBIAN_VERSION} (${DEBIAN_CODENAME})"
-}
-
-configure_network_interactive() {
-    log_step "配置网络参数"
-
-    # 选择网络模式
-    local c
-    c=$(prompt_choice "请选择网络配置模式:" "仅 IPv4" "仅 IPv6" "IPv4 + IPv6（双栈）")
-    case "$c" in
-        1) NET_MODE="ipv4" ;;
-        2) NET_MODE="ipv6" ;;
-        3) NET_MODE="dual" ;;
-    esac
-    log_info "网络模式: $NET_MODE"
-
-    echo ""
-    echo "接下来逐项确认网络参数（直接回车使用检测值）:"
     echo ""
 
-    if [[ "$NET_MODE" == "ipv4" || "$NET_MODE" == "dual" ]]; then
-        echo "--- IPv4 配置 ---"
-        if [[ -z "$IPV4_ADDR" ]]; then
-            log_warn "未检测到 IPv4 地址，请手动输入"
-            IPV4_ADDR=$(prompt_required "IPv4 地址")
-        else
-            IPV4_ADDR=$(prompt_with_default "IPv4 地址" "$IPV4_ADDR")
-        fi
-
-        if [[ -z "$IPV4_MASK" ]]; then
-            log_warn "未检测到子网掩码，请手动输入"
-            IPV4_MASK=$(prompt_required "IPv4 子网掩码 (如 255.255.255.0)")
-        else
-            IPV4_MASK=$(prompt_with_default "IPv4 子网掩码" "$IPV4_MASK")
-        fi
-
-        if [[ -z "$IPV4_GW" ]]; then
-            log_warn "未检测到 IPv4 网关，请手动输入"
-            IPV4_GW=$(prompt_required "IPv4 网关")
-        else
-            IPV4_GW=$(prompt_with_default "IPv4 网关" "$IPV4_GW")
-        fi
-        echo ""
-    fi
-
-    if [[ "$NET_MODE" == "ipv6" || "$NET_MODE" == "dual" ]]; then
-        echo "--- IPv6 配置 ---"
-        if [[ -z "$IPV6_ADDR" ]]; then
-            log_warn "未检测到 IPv6 地址，请手动输入"
-            IPV6_ADDR=$(prompt_required "IPv6 地址")
-        else
-            IPV6_ADDR=$(prompt_with_default "IPv6 地址" "$IPV6_ADDR")
-        fi
-
-        if [[ -z "$IPV6_PREFIX" ]]; then
-            log_warn "未检测到 IPv6 前缀长度，请手动输入"
-            IPV6_PREFIX=$(prompt_required "IPv6 前缀长度 (如 64)")
-        else
-            IPV6_PREFIX=$(prompt_with_default "IPv6 前缀长度" "$IPV6_PREFIX")
-        fi
-
-        if [[ -z "$IPV6_GW" ]]; then
-            log_warn "未检测到 IPv6 网关，请手动输入"
-            IPV6_GW=$(prompt_required "IPv6 网关")
-        else
-            IPV6_GW=$(prompt_with_default "IPv6 网关" "$IPV6_GW")
-        fi
-        echo ""
-    fi
-
-    echo "--- 通用网络配置 ---"
-    DNS_SERVERS=$(prompt_with_default "DNS 服务器（空格分隔多个）" "$DNS_SERVERS")
-    HOSTNAME_NEW=$(prompt_with_default "Hostname" "$HOSTNAME_NEW")
-
-    echo ""
-    echo "╔══════════════════════════════════════════╗"
-    echo "║        最终写入的网络配置                 ║"
-    echo "╠══════════════════════════════════════════╣"
-    echo "║ 模式:      $NET_MODE"
-    if [[ "$NET_MODE" == "ipv4" || "$NET_MODE" == "dual" ]]; then
-        echo "║ IPv4 地址: $IPV4_ADDR"
-        echo "║ IPv4 掩码: $IPV4_MASK"
-        echo "║ IPv4 网关: $IPV4_GW"
-    fi
-    if [[ "$NET_MODE" == "ipv6" || "$NET_MODE" == "dual" ]]; then
-        echo "║ IPv6 地址: $IPV6_ADDR"
-        echo "║ IPv6 前缀: $IPV6_PREFIX"
-        echo "║ IPv6 网关: $IPV6_GW"
-    fi
-    echo "║ DNS:       $DNS_SERVERS"
-    echo "║ Hostname:  $HOSTNAME_NEW"
-    echo "╚══════════════════════════════════════════╝"
-    echo ""
-}
-
-configure_accounts() {
-    log_step "配置账户"
-
-    local c
-    c=$(prompt_choice "用户策略:" "仅使用 root，不创建普通用户" "创建一个普通用户（同时也会有 root）")
-    if [[ "$c" == "1" ]]; then
-        USER_STRATEGY="root_only"
-        NORMAL_USER=""
-    else
-        USER_STRATEGY="create_user"
-        NORMAL_USER=$(prompt_required "请输入普通用户名")
-    fi
-
-    echo ""
-    echo "设置 root 密码:"
-    ROOT_PW_HASH=$(prompt_password "root")
-
-    if [[ "$USER_STRATEGY" == "create_user" ]]; then
-        echo ""
-        echo "设置 ${NORMAL_USER} 用户密码:"
-        USER_PW_HASH=$(prompt_password "$NORMAL_USER")
-    fi
-
-    log_info "用户策略: $USER_STRATEGY"
-    if [[ -n "$NORMAL_USER" ]]; then
-        log_info "普通用户: $NORMAL_USER"
+    # 允许用户修改
+    read -rp "$(echo -e "${YELLOW}是否需要手动修改网络配置？[y/N]: ${NC}")" modify_net
+    if [[ "${modify_net,,}" == "y" ]]; then
+        read -rp "网卡接口 [${NET_IFACE}]: " tmp && [[ -n "$tmp" ]] && NET_IFACE="$tmp"
+        read -rp "IPv4 地址 [${NET_IP}]: " tmp && [[ -n "$tmp" ]] && NET_IP="$tmp"
+        read -rp "子网掩码 [${NET_MASK}]: " tmp && [[ -n "$tmp" ]] && NET_MASK="$tmp"
+        read -rp "默认网关 [${NET_GW}]: " tmp && [[ -n "$tmp" ]] && NET_GW="$tmp"
+        read -rp "DNS 1 [${NET_DNS1}]: " tmp && [[ -n "$tmp" ]] && NET_DNS1="$tmp"
+        read -rp "DNS 2 [${NET_DNS2}]: " tmp && [[ -n "$tmp" ]] && NET_DNS2="$tmp"
+        msg_ok "网络配置已更新"
     fi
 }
 
-configure_ssh() {
-    log_step "配置 SSH"
+#——————————————————————————————————————————————
+# 第 4 步：用户交互 - 系统配置
+#——————————————————————————————————————————————
+SSH_PORT="22"
+ROOT_PASSWORD=""
+USE_SSH_KEY="no"
+SSH_PUBLIC_KEY=""
+DISABLE_PASSWORD_AUTH="no"
+INSTALL_FAIL2BAN="no"
+SELECTED_MIRROR=""
+SETUP_FIREWALL="yes"
+TIMEZONE="Asia/Shanghai"
 
-    SSH_PORT=$(prompt_with_default "SSH 端口" "22")
-    # 端口校验
-    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
-        log_warn "端口无效，使用默认 22"
-        SSH_PORT="22"
-    fi
+user_config() {
+    msg_step "第 4 步：系统配置（安装后自动生效）"
 
+    # 4.1 选择镜像源
     echo ""
-    echo "请输入 SSH 公钥（每行一个，输入空行结束）:"
-    echo "（如果没有公钥，直接按回车跳过）"
-    SSH_PUBKEYS=""
-    while true; do
-        local line
-        read -rp "> " line
-        if [[ -z "$line" ]]; then
+    msg_info "请选择 Debian 镜像源："
+    local sorted_keys
+    sorted_keys=$(echo "${!MIRRORS[@]}" | tr ' ' '\n' | sort)
+    for key in $sorted_keys; do
+        echo "  ${key}  →  ${MIRRORS[$key]}"
+    done
+    echo ""
+    read -rp "请输入选项编号 [1]: " mirror_choice
+    mirror_choice="${mirror_choice:-1}"
+    local found=0
+    for key in "${!MIRRORS[@]}"; do
+        if [[ "$key" == "${mirror_choice}-"* ]]; then
+            SELECTED_MIRROR="${MIRRORS[$key]}"
+            found=1
             break
         fi
-        # 基础格式检查
-        if [[ "$line" =~ ^ssh-(rsa|ed25519|ecdsa)|^ecdsa-sha2 ]]; then
-            SSH_PUBKEYS="${SSH_PUBKEYS}${line}"$'\n'
-        else
-            echo "  ⚠ 公钥格式似乎不正确（应以 ssh-rsa / ssh-ed25519 / ecdsa-sha2 开头），仍然添加？(y/N)"
-            local confirm
-            read -r confirm
-            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                SSH_PUBKEYS="${SSH_PUBKEYS}${line}"$'\n'
-            fi
-        fi
     done
+    [[ $found -eq 0 ]] && SELECTED_MIRROR="${MIRRORS["1-官方(美国)"]}"
+    msg_ok "镜像源: ${SELECTED_MIRROR}"
 
-    if [[ -n "$SSH_PUBKEYS" ]]; then
-        SSH_ROOT_POLICY="pubkey_only"
-        local key_count
-        key_count=$(echo -n "$SSH_PUBKEYS" | grep -c '.' || true)
-        log_info "已添加 $key_count 个公钥 → root 仅公钥登录"
-    else
-        SSH_ROOT_POLICY="password_allowed"
-        log_info "未提供公钥 → root 允许密码登录"
+    # 4.2 SSH 端口
+    echo ""
+    read -rp "$(echo -e "${CYAN}设置 SSH 端口 [22]: ${NC}")" SSH_PORT
+    SSH_PORT="${SSH_PORT:-22}"
+    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [[ "$SSH_PORT" -lt 1 || "$SSH_PORT" -gt 65535 ]]; then
+        msg_warn "端口号无效，使用默认值 22"
+        SSH_PORT="22"
     fi
-    log_info "SSH 端口: $SSH_PORT"
+    msg_ok "SSH 端口: ${SSH_PORT}"
+
+    # 4.3 Root 密码
+    echo ""
+    while true; do
+        read -srp "$(echo -e "${CYAN}设置 root 密码: ${NC}")" ROOT_PASSWORD
+        echo ""
+        if [[ ${#ROOT_PASSWORD} -lt 8 ]]; then
+            msg_warn "密码长度至少 8 位，请重新输入。"
+            continue
+        fi
+        read -srp "$(echo -e "${CYAN}再次输入 root 密码: ${NC}")" root_pw_confirm
+        echo ""
+        if [[ "$ROOT_PASSWORD" != "$root_pw_confirm" ]]; then
+            msg_warn "两次密码不一致，请重新输入。"
+            continue
+        fi
+        break
+    done
+    msg_ok "root 密码已设置"
+
+    # 4.4 SSH 密钥登录
+    echo ""
+    read -rp "$(echo -e "${CYAN}是否配置 SSH 密钥登录？[y/N]: ${NC}")" use_key
+    if [[ "${use_key,,}" == "y" ]]; then
+        USE_SSH_KEY="yes"
+        echo ""
+        msg_info "请输入你的 SSH 公钥（ssh-rsa/ssh-ed25519 开头的完整内容）："
+        msg_info "（也可以输入公钥的 URL，如 https://github.com/username.keys）"
+        read -rp "> " key_input
+        if [[ "$key_input" == http* ]]; then
+            msg_info "正在从 URL 下载公钥..."
+            SSH_PUBLIC_KEY=$(wget -qO- --timeout=10 "$key_input" 2>/dev/null) || {
+                msg_error "无法下载公钥，请直接粘贴公钥内容。"
+                read -rp "> " SSH_PUBLIC_KEY
+            }
+        else
+            SSH_PUBLIC_KEY="$key_input"
+        fi
+        # 验证公钥格式
+        if [[ ! "$SSH_PUBLIC_KEY" =~ ^ssh-(rsa|ed25519|ecdsa) ]]; then
+            msg_warn "公钥格式看起来不正确，请确认。继续使用当前输入。"
+        fi
+        msg_ok "SSH 公钥已设置"
+
+        # 是否禁用密码登录
+        read -rp "$(echo -e "${CYAN}是否禁用 SSH 密码登录（仅允许密钥）？[y/N]: ${NC}")" disable_pw
+        if [[ "${disable_pw,,}" == "y" ]]; then
+            DISABLE_PASSWORD_AUTH="yes"
+            msg_ok "安装后将禁用密码登录"
+        fi
+    fi
+
+    # 4.5 防火墙
+    echo ""
+    read -rp "$(echo -e "${CYAN}是否安装并配置防火墙 (nftables)？[Y/n]: ${NC}")" setup_fw
+    if [[ "${setup_fw,,}" != "n" ]]; then
+        SETUP_FIREWALL="yes"
+        msg_ok "将自动配置防火墙，放行 SSH 端口 ${SSH_PORT}"
+    else
+        SETUP_FIREWALL="no"
+    fi
+
+    # 4.6 Fail2ban
+    read -rp "$(echo -e "${CYAN}是否安装 fail2ban 防暴力破解？[Y/n]: ${NC}")" install_f2b
+    if [[ "${install_f2b,,}" != "n" ]]; then
+        INSTALL_FAIL2BAN="yes"
+        msg_ok "将自动安装 fail2ban"
+    fi
+
+    # 4.7 时区
+    echo ""
+    read -rp "$(echo -e "${CYAN}设置时区 [Asia/Shanghai]: ${NC}")" TIMEZONE
+    TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
+    msg_ok "时区: ${TIMEZONE}"
 }
 
-configure_kernel() {
-    log_step "配置内核"
+#——————————————————————————————————————————————
+# 第 5 步：下载 netboot 文件并校验
+#——————————————————————————————————————————————
+download_and_verify() {
+    msg_step "第 5 步：下载 Netboot 文件并验证完整性"
 
-    # =========================================================================
-    # Cloud 内核说明:
-    #
-    # Debian 12 (bookworm):
-    #   - 默认仓库提供 linux-image-cloud-amd64 (基于 6.1 内核)
-    #   - 如需更新版本 cloud 内核，需要启用 bookworm-backports
-    #   - backports 中有基于更高版本的 linux-image-cloud-amd64
-    #   - 本脚本仅按需启用 backports，且仅安装 cloud kernel，不切换整套系统
-    #
-    # Debian 13 (trixie):
-    #   - 原生仓库直接提供较新版本的 linux-image-cloud-amd64
-    #   - 无需额外启用 backports
-    #   - 直接从主仓库安装即可
-    # =========================================================================
+    local base_url="${SELECTED_MIRROR}/dists/${DEBIAN_VERSION}/main/installer-${DEBIAN_ARCH}/current/images"
+    local netboot_path="netboot/debian-installer/${DEBIAN_ARCH}"
+    local checksum_url="${base_url}/SHA256SUMS"
+    local sign_url="${base_url}/SHA256SUMS.gpg"
 
-    local c
-    c=$(prompt_choice "是否安装 cloud 优化内核？(适合云服务器/VPS)" "是，安装 cloud 内核" "否，使用默认内核")
-    if [[ "$c" == "1" ]]; then
-        INSTALL_CLOUD_KERNEL="yes"
-        if [[ "$DEBIAN_VERSION" == "12" ]]; then
-            local bc
-            bc=$(prompt_choice "Debian 12 cloud 内核来源:" \
-                "使用默认仓库的 cloud 内核 (6.1 系列)" \
-                "启用 backports 获取更新版 cloud 内核")
-            if [[ "$bc" == "2" ]]; then
-                ENABLE_BACKPORTS="yes"
-                log_info "将启用 bookworm-backports（仅用于 cloud 内核）"
+    mkdir -p "${NETBOOT_DIR}"
+    cd "${NETBOOT_DIR}"
+
+    # 下载内核和 initrd
+    msg_info "正在下载 linux 内核..."
+    wget -4 -q --show-progress -O linux "${base_url}/${netboot_path}/linux" || {
+        msg_error "下载 linux 内核失败！请检查网络或更换镜像源。"
+        exit 1
+    }
+
+    msg_info "正在下载 initrd.gz..."
+    wget -4 -q --show-progress -O initrd.gz "${base_url}/${netboot_path}/initrd.gz" || {
+        msg_error "下载 initrd.gz 失败！"
+        exit 1
+    }
+
+    # 下载校验文件
+    msg_info "正在下载校验文件..."
+    wget -4 -q -O SHA256SUMS "${checksum_url}" || {
+        msg_error "下载 SHA256SUMS 失败！"
+        exit 1
+    }
+
+    # 尝试 GPG 签名验证
+    local gpg_verified=0
+    msg_info "正在下载 GPG 签名..."
+    if wget -4 -q -O SHA256SUMS.gpg "${sign_url}" 2>/dev/null; then
+        msg_info "正在验证 GPG 签名..."
+        # Debian 的发布签名密钥
+        local keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+        if [[ -f "$keyring" ]]; then
+            if gpgv --keyring "$keyring" SHA256SUMS.gpg SHA256SUMS 2>/dev/null; then
+                msg_ok "GPG 签名验证通过 ✓"
+                gpg_verified=1
             else
-                ENABLE_BACKPORTS="no"
+                msg_warn "GPG 签名验证失败！文件可能被篡改！"
+                confirm_or_exit "是否仍然继续？（不推荐）"
             fi
         else
-            ENABLE_BACKPORTS="no"
-            log_info "Debian 13 直接使用主仓库的 cloud 内核"
+            msg_warn "未找到 Debian 密钥环 (${keyring})，跳过 GPG 验证。"
+            msg_info "可通过 apt install debian-keyring 安装。"
         fi
     else
-        INSTALL_CLOUD_KERNEL="no"
-        ENABLE_BACKPORTS="no"
-    fi
-    log_info "Cloud 内核: $INSTALL_CLOUD_KERNEL | Backports: $ENABLE_BACKPORTS"
-}
-
-# =============================================================================
-# 第四阶段：下载并校验 netboot 文件
-# =============================================================================
-download_netboot_files() {
-    log_step "下载 netboot 文件"
-
-    mkdir -p "$NETBOOT_DIR"
-    chmod 700 "$NETBOOT_DIR"
-
-    local base_url sums_base
-    if [[ "$DEBIAN_VERSION" == "12" ]]; then
-        base_url="$DEB12_BASE"
-        sums_base="$DEB12_SUMS_BASE"
-    else
-        base_url="$DEB13_BASE"
-        sums_base="$DEB13_SUMS_BASE"
+        msg_warn "无法下载 GPG 签名文件，跳过签名验证。"
     fi
 
-    local linux_url="${base_url}/linux"
-    local initrd_url="${base_url}/initrd.gz"
-    local sums_url="${sums_base}/SHA256SUMS"
-
-    log_info "下载 linux ..."
-    download_file "$linux_url" "${NETBOOT_DIR}/vmlinuz"
-    log_info "下载 initrd.gz ..."
-    download_file "$initrd_url" "${NETBOOT_DIR}/initrd.gz"
-    log_info "下载 SHA256SUMS ..."
-    download_file "$sums_url" "${NETBOOT_DIR}/SHA256SUMS"
-
-    # 校验
-    log_info "校验文件完整性 ..."
-    verify_checksum
-    log_info "文件校验通过 ✓"
-}
-
-download_file() {
-    local url="$1" dest="$2"
-    if [[ "$DOWNLOAD_TOOL" == "wget" ]]; then
-        wget -q --timeout=30 --tries=3 -O "$dest" "$url" || die "下载失败: $url"
-    else
-        curl -fsSL --connect-timeout 30 --retry 3 -o "$dest" "$url" || die "下载失败: $url"
-    fi
-}
-
-verify_checksum() {
-    cd "$NETBOOT_DIR" || die "无法进入 $NETBOOT_DIR"
-
-    # SHA256SUMS 包含所有安装镜像（cdrom、hd-media、netboot 等）的校验值
-    # 路径格式: ./netboot/debian-installer/amd64/linux
-    # 必须精确匹配 netboot 路径，否则会拿到其他镜像的校验值
-    local linux_expected initrd_expected
-    local netboot_path="netboot/debian-installer/amd64"
-
-    # 显示 SHA256SUMS 中所有 netboot 相关条目（诊断用）
-    log_info "SHA256SUMS 中匹配 '${netboot_path}' 的条目:"
-    grep "${netboot_path}" SHA256SUMS >&2 || log_warn "  (无匹配条目)"
-
-    linux_expected=$(grep -E "${netboot_path}/linux$" SHA256SUMS | head -1 | awk '{print $1}') || true
-    initrd_expected=$(grep -E "${netboot_path}/initrd\.gz$" SHA256SUMS | head -1 | awk '{print $1}') || true
-
-    local linux_actual initrd_actual
-    linux_actual=$(sha256sum vmlinuz | awk '{print $1}')
+    # SHA256 校验
+    msg_info "正在进行 SHA256 校验..."
+    local linux_expected initrd_expected linux_actual initrd_actual
+    linux_expected=$(grep "${netboot_path}/linux$" SHA256SUMS | awk '{print $1}')
+    initrd_expected=$(grep "${netboot_path}/initrd.gz$" SHA256SUMS | awk '{print $1}')
+    linux_actual=$(sha256sum linux | awk '{print $1}')
     initrd_actual=$(sha256sum initrd.gz | awk '{print $1}')
 
-    log_info "校验对比:"
-    log_info "  linux   — SHA256SUMS: ${linux_expected:-(未找到)}"
-    log_info "  linux   — 实际文件:   ${linux_actual}"
-    log_info "  initrd  — SHA256SUMS: ${initrd_expected:-(未找到)}"
-    log_info "  initrd  — 实际文件:   ${initrd_actual}"
-
-    local failed=0
-
-    # 检查是否找到了条目
     if [[ -z "$linux_expected" || -z "$initrd_expected" ]]; then
-        log_warn "SHA256SUMS 中未找到 netboot 路径的条目"
-        log_warn "SHA256SUMS 中所有 linux/initrd 条目如下:"
-        grep -E '(linux|initrd)' SHA256SUMS >&2 || true
-        failed=1
-    fi
-
-    # 比较哈希
-    if [[ "$failed" -eq 0 ]]; then
-        if [[ "$linux_actual" != "$linux_expected" ]]; then
-            log_error "linux 校验不匹配！"
-            failed=1
-        fi
-        if [[ "$initrd_actual" != "$initrd_expected" ]]; then
-            log_error "initrd.gz 校验不匹配！"
-            failed=1
-        fi
-    fi
-
-    if [[ "$failed" -eq 0 ]]; then
-        cd - &>/dev/null
-        return 0
-    fi
-
-    # 校验失败 — 给用户完整信息和选择
-    echo "" >&2
-    echo "╔══════════════════════════════════════════════════════════════╗" >&2
-    echo "║  ⚠  SHA256 校验未通过                                       ║" >&2
-    echo "╠══════════════════════════════════════════════════════════════╣" >&2
-    echo "║                                                            ║" >&2
-    echo "║  可能原因:                                                  ║" >&2
-    echo "║  1. 镜像正在同步（尤其 trixie/testing 经常发生）            ║" >&2
-    echo "║  2. SHA256SUMS 和实际文件版本不一致                         ║" >&2
-    echo "║  3. 下载过程中文件损坏                                      ║" >&2
-    echo "║                                                            ║" >&2
-    echo "║  建议:                                                      ║" >&2
-    echo "║  • 等几分钟后重新运行脚本                                   ║" >&2
-    echo "║  • 或检查 ${NETBOOT_DIR}/SHA256SUMS 内容                    ║" >&2
-    echo "║  • 手动运行: sha256sum ${NETBOOT_DIR}/initrd.gz             ║" >&2
-    echo "║                                                            ║" >&2
-    echo "╚══════════════════════════════════════════════════════════════╝" >&2
-    echo "" >&2
-    echo "你可以选择:" >&2
-    echo "  1. 中止脚本（推荐，稍后重试）" >&2
-    echo "  2. 忽略校验错误继续（有风险，文件可能不完整）" >&2
-    read -rp "请输入 1 或 2 [默认 1]: " verify_choice
-    if [[ "$verify_choice" == "2" ]]; then
-        log_warn "用户选择忽略校验错误，继续执行"
+        msg_warn "无法从 SHA256SUMS 中提取预期校验值。"
+        msg_info "linux  实际 SHA256: ${linux_actual}"
+        msg_info "initrd 实际 SHA256: ${initrd_actual}"
+        confirm_or_exit "无法自动校验，是否继续？"
     else
-        die "校验失败，用户选择中止。请稍后重新运行脚本。"
+        if [[ "$linux_expected" == "$linux_actual" ]]; then
+            msg_ok "linux  SHA256 校验通过 ✓"
+        else
+            msg_error "linux  SHA256 校验失败！"
+            msg_error "  预期: ${linux_expected}"
+            msg_error "  实际: ${linux_actual}"
+            exit 1
+        fi
+        if [[ "$initrd_expected" == "$initrd_actual" ]]; then
+            msg_ok "initrd SHA256 校验通过 ✓"
+        else
+            msg_error "initrd SHA256 校验失败！"
+            msg_error "  预期: ${initrd_expected}"
+            msg_error "  实际: ${initrd_actual}"
+            exit 1
+        fi
     fi
 
-    cd - &>/dev/null
+    msg_ok "文件下载和验证完成"
 }
 
-# =============================================================================
-# 第五阶段：生成 preseed
-# =============================================================================
+#——————————————————————————————————————————————
+# 第 6 步：生成 preseed 配置（网络 + 后续配置）
+#——————————————————————————————————————————————
 generate_preseed() {
-    log_step "生成 preseed 配置"
+    msg_step "第 6 步：生成 Preseed 预配置文件"
 
-    local preseed_content=""
+    # 密码哈希
+    local root_pw_hash
+    root_pw_hash=$(echo "${ROOT_PASSWORD}" | openssl passwd -6 -stdin 2>/dev/null) || \
+    root_pw_hash=$(python3 -c "import crypt; print(crypt.crypt('${ROOT_PASSWORD}', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null) || {
+        msg_error "无法生成密码哈希！"
+        exit 1
+    }
 
-    # --- 语言和地区 ---
-    preseed_content+="# 语言和地区
-d-i debian-installer/locale string en_US.UTF-8
-d-i keyboard-configuration/xkb-keymap select us
-"
-
-    # --- 网络配置 ---
-    # 禁用安装器的自动网络检测（避免覆盖手动配置）
-    preseed_content+="
-# 网络配置 — 禁用自动检测
-d-i netcfg/enable boolean true
-d-i netcfg/choose_interface select ${NET_IFACE}
-d-i netcfg/disable_autoconfig boolean true
-d-i netcfg/disable_dhcp boolean true
-d-i netcfg/hostname string ${HOSTNAME_NEW}
-d-i netcfg/get_hostname string ${HOSTNAME_NEW}
-d-i netcfg/get_domain string unassigned-domain
-"
-
-    if [[ "$NET_MODE" == "ipv4" || "$NET_MODE" == "dual" ]]; then
-        preseed_content+="
-# IPv4
-d-i netcfg/get_ipaddress string ${IPV4_ADDR}
-d-i netcfg/get_netmask string ${IPV4_MASK}
-d-i netcfg/get_gateway string ${IPV4_GW}
-d-i netcfg/get_nameservers string ${DNS_SERVERS// / }
-d-i netcfg/confirm_static boolean true
-"
-    fi
-
-    # 注意：Debian installer 对 IPv6 的 preseed 支持有限。
-    # 对于纯 IPv6 或双栈，我们在 preseed 中尽量配置，
-    # 但可能需要在 VNC 安装中手动确认。
-    if [[ "$NET_MODE" == "ipv6" ]]; then
-        preseed_content+="
-# IPv6 (注意：Debian installer 对纯 IPv6 preseed 支持有限，可能需要 VNC 中确认)
-d-i netcfg/get_ipaddress string ${IPV6_ADDR}
-d-i netcfg/get_netmask string ${IPV6_PREFIX}
-d-i netcfg/get_gateway string ${IPV6_GW}
-d-i netcfg/get_nameservers string ${DNS_SERVERS// / }
-d-i netcfg/confirm_static boolean true
-"
-    fi
-
-    if [[ "$NET_MODE" == "dual" ]]; then
-        preseed_content+="
-# 双栈提示：IPv6 可能需要在 VNC 安装过程中手动配置
-# installer 的 preseed 主要处理 IPv4，IPv6 部分可能需要通过内核参数或手动设置
-"
-    fi
-
-    # --- 镜像 ---
-    preseed_content+="
-# 镜像
-d-i mirror/country string manual
-d-i mirror/http/hostname string deb.debian.org
-d-i mirror/http/directory string /debian
-d-i mirror/http/proxy string
-d-i mirror/suite string ${DEBIAN_CODENAME}
-"
-
-    # --- 账户 ---
-    if [[ "$USER_STRATEGY" == "root_only" ]]; then
-        preseed_content+="
-# 账户 — 仅 root
-d-i passwd/root-login boolean true
-d-i passwd/make-user boolean false
-d-i passwd/root-password-crypted string ${ROOT_PW_HASH}
-"
-    else
-        preseed_content+="
-# 账户 — root + 普通用户
-d-i passwd/root-login boolean true
-d-i passwd/make-user boolean true
-d-i passwd/root-password-crypted string ${ROOT_PW_HASH}
-d-i passwd/user-fullname string ${NORMAL_USER}
-d-i passwd/username string ${NORMAL_USER}
-d-i passwd/user-password-crypted string ${USER_PW_HASH}
-"
-    fi
-
-    # --- 分区：留给用户在 VNC 中手动 ---
-    # 不做任何自动分区配置
-    preseed_content+="
-# 分区 — 不自动配置，留给 VNC 手动操作
-# （不设置 partman-auto 相关选项）
-"
-
-    # --- Bootloader：不预设安装目标 ---
-    preseed_content+="
-# Bootloader — 不预设目标磁盘，由 VNC 中手动确认
-# d-i grub-installer/bootdev string （留空，安装器会询问）
-"
-
-    # --- 时区 ---
-    preseed_content+="
-# 时区
-d-i time/zone string UTC
-d-i clock-setup/utc boolean true
-d-i clock-setup/ntp boolean true
-"
-
-    # --- 软件包 ---
-    preseed_content+="
-# 软件选择 — 最小安装 + SSH
-tasksel tasksel/first multiselect ssh-server
-d-i pkgsel/include string openssh-server
-d-i pkgsel/upgrade select safe-upgrade
-popularity-contest popularity-contest/participate boolean false
-"
-
-    # --- Cloud 内核 & Backports ---
-    if [[ "$INSTALL_CLOUD_KERNEL" == "yes" ]]; then
-        if [[ "$DEBIAN_VERSION" == "12" && "$ENABLE_BACKPORTS" == "yes" ]]; then
-            preseed_content+="
-# Cloud 内核 (Debian 12 + backports)
-# 在 late_command 中启用 backports 并安装 cloud 内核
-"
-        elif [[ "$DEBIAN_VERSION" == "12" ]]; then
-            preseed_content+="
-# Cloud 内核 (Debian 12 默认仓库)
-d-i pkgsel/include string openssh-server linux-image-cloud-amd64
-"
-        else
-            preseed_content+="
-# Cloud 内核 (Debian 13 主仓库)
-d-i pkgsel/include string openssh-server linux-image-cloud-amd64
-"
-        fi
-    fi
-
-    # --- late_command：安装后执行的命令 ---
-    local late_cmds=""
+    # 构建 late_command 脚本（安装后自动执行）
+    # 注意：preseed 中 late_command 使用 in-target 执行命令
+    local late_commands=""
 
     # SSH 配置
-    late_cmds+="
-# 配置 sshd
-in-target bash -c 'mkdir -p /etc/ssh/sshd_config.d';
-in-target bash -c 'cat > /etc/ssh/sshd_config.d/99-custom.conf << SSHEOF
-Port ${SSH_PORT}
-PermitRootLogin ##ROOT_LOGIN##
-PasswordAuthentication ##PASSWD_AUTH##
-PubkeyAuthentication yes
-ChallengeResponseAuthentication no
-X11Forwarding no
-AllowAgentForwarding no
-AllowTcpForwarding no
-MaxAuthTries 5
-LoginGraceTime 30
-ClientAliveInterval 300
-ClientAliveCountMax 2
-SSHEOF';
-"
+    late_commands+="in-target sed -i 's/^#\\?Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config; "
+    late_commands+="in-target sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config; "
+    late_commands+="in-target sed -i 's/^#\\?UseDNS .*/UseDNS no/' /etc/ssh/sshd_config; "
 
-    # SSH Root 策略
-    if [[ "$SSH_ROOT_POLICY" == "pubkey_only" ]]; then
-        late_cmds="${late_cmds//\#\#ROOT_LOGIN\#\#/prohibit-password}"
-        late_cmds="${late_cmds//\#\#PASSWD_AUTH\#\#/no}"
-    else
-        late_cmds="${late_cmds//\#\#ROOT_LOGIN\#\#/yes}"
-        late_cmds="${late_cmds//\#\#PASSWD_AUTH\#\#/yes}"
-    fi
+    # SSH 密钥
+    if [[ "$USE_SSH_KEY" == "yes" ]]; then
+        late_commands+="in-target mkdir -p /root/.ssh; "
+        late_commands+="in-target chmod 700 /root/.ssh; "
+        # 使用 printf 避免引号问题
+        late_commands+="in-target sh -c 'printf \"%s\n\" \"${SSH_PUBLIC_KEY}\" > /root/.ssh/authorized_keys'; "
+        late_commands+="in-target chmod 600 /root/.ssh/authorized_keys; "
+        late_commands+="in-target sed -i 's/^#\\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config; "
 
-    # SSH 公钥
-    if [[ -n "$SSH_PUBKEYS" ]]; then
-        # 转义公钥中的特殊字符
-        local escaped_keys
-        escaped_keys=$(echo -n "$SSH_PUBKEYS" | sed '/^$/d')
-        late_cmds+="
-in-target bash -c 'mkdir -p /root/.ssh && chmod 700 /root/.ssh';
-in-target bash -c 'cat > /root/.ssh/authorized_keys << KEYEOF
-${escaped_keys}
-KEYEOF';
-in-target bash -c 'chmod 600 /root/.ssh/authorized_keys';
-"
-    fi
-
-    # Cloud 内核 backports（仅 Debian 12 且选择了 backports）
-    if [[ "$INSTALL_CLOUD_KERNEL" == "yes" && "$DEBIAN_VERSION" == "12" && "$ENABLE_BACKPORTS" == "yes" ]]; then
-        late_cmds+="
-# 启用 bookworm-backports 并安装 cloud 内核
-in-target bash -c 'echo \"deb https://deb.debian.org/debian bookworm-backports main\" > /etc/apt/sources.list.d/backports.list';
-in-target bash -c 'cat > /etc/apt/preferences.d/99-backports-cloud-kernel << PREFEOF
-Package: linux-image-cloud-amd64 linux-image-*-cloud-amd64
-Pin: release a=bookworm-backports
-Pin-Priority: 500
-
-Package: *
-Pin: release a=bookworm-backports
-Pin-Priority: 100
-PREFEOF';
-in-target bash -c 'apt-get update -qq && apt-get install -y -t bookworm-backports linux-image-cloud-amd64';
-"
-    fi
-
-    # 组装 late_command
-    if [[ -n "$late_cmds" ]]; then
-        # 将多行命令合并为一行（preseed late_command 格式要求）
-        local joined
-        joined=$(echo "$late_cmds" | sed '/^$/d' | sed '/^#/d' | tr '\n' ' ' | sed 's/;  */; /g' | sed 's/^  *//' | sed 's/  *$//')
-        preseed_content+="
-# 安装后执行
-d-i preseed/late_command string ${joined}
-"
-    fi
-
-    # --- 安装完成 ---
-    preseed_content+="
-# 安装完成后重启
-d-i finish-install/reboot_in_progress note
-"
-
-    # 写入文件
-    echo "$preseed_content" > "$PRESEED_FILE"
-    chmod 600 "$PRESEED_FILE"
-    log_info "Preseed 已写入: $PRESEED_FILE"
-}
-
-# =============================================================================
-# 第五阶段 B：将 preseed 打包进 initrd
-# =============================================================================
-# Debian installer 运行在自己的 initrd 环境中，无法访问宿主系统的硬盘文件。
-# 因此必须将 preseed.cfg 嵌入 initrd.gz 内部，installer 才能读取到。
-# 方法：用 cpio 追加 preseed.cfg 到 initrd.gz 末尾（CPIO 支持多段拼接）。
-repack_initrd() {
-    log_step "将 preseed.cfg 嵌入 initrd.gz"
-
-    # 确保 cpio 可用
-    if ! require_cmd cpio; then
-        apt-get install -y -qq cpio || die "无法安装 cpio"
-    fi
-
-    local initrd_file="${NETBOOT_DIR}/initrd.gz"
-    local preseed_src="${PRESEED_FILE}"
-
-    # 备份原始 initrd
-    cp "$initrd_file" "${initrd_file}.orig"
-    log_info "已备份原始 initrd → ${initrd_file}.orig"
-
-    # 创建临时工作目录
-    local tmpdir
-    tmpdir=$(mktemp -d "${NETBOOT_DIR}/repack.XXXXXX")
-
-    # 将 preseed.cfg 复制到临时目录根（installer 期望在 /preseed.cfg）
-    cp "$preseed_src" "${tmpdir}/preseed.cfg"
-
-    # 用 cpio 生成追加段，gzip 压缩后拼接到 initrd.gz 末尾
-    # Linux initrd 支持多段 cpio 拼接，内核会依次解包
-    (
-        cd "$tmpdir" || die "无法进入临时目录"
-        echo "preseed.cfg" | cpio -o -H newc 2>/dev/null | gzip >> "$initrd_file"
-    ) || die "将 preseed.cfg 嵌入 initrd 失败"
-
-    # 清理临时目录
-    rm -rf "$tmpdir"
-
-    log_info "preseed.cfg 已嵌入 initrd.gz ✓"
-    log_info "  内核参数将使用: preseed/file=/preseed.cfg"
-}
-
-# =============================================================================
-# 第六阶段：配置 GRUB
-# =============================================================================
-configure_grub() {
-    log_step "配置 GRUB 启动项"
-
-    # 检查 GRUB_DEFAULT 是否支持 saved（grub-reboot 需要此设置）
-    local grub_default
-    grub_default=$(grep -E '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"' || true)
-
-    if [[ "$grub_default" != "saved" ]]; then
-        log_info "设置 GRUB_DEFAULT=saved（grub-reboot 所需）"
-        cp /etc/default/grub "/etc/default/grub.bak.$(date +%Y%m%d%H%M%S)"
-        if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
-            sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
-        else
-            echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
+        if [[ "$DISABLE_PASSWORD_AUTH" == "yes" ]]; then
+            late_commands+="in-target sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config; "
         fi
     fi
 
-    # 备份 40_custom
-    if [[ -f "$GRUB_CUSTOM" ]]; then
-        cp "$GRUB_CUSTOM" "$GRUB_CUSTOM_BACKUP"
-        log_info "已备份: $GRUB_CUSTOM → $GRUB_CUSTOM_BACKUP"
+    # 防火墙 (nftables)
+    if [[ "$SETUP_FIREWALL" == "yes" ]]; then
+        late_commands+="in-target apt-get install -y nftables; "
+        late_commands+="in-target systemctl enable nftables; "
+        # 写入 nftables 规则文件
+        late_commands+="in-target sh -c 'cat > /etc/nftables.conf << \"NFTEOF\"
+#!/usr/sbin/nft -f
+flush ruleset
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+        tcp dport ${SSH_PORT} ct state new accept
+        icmp type echo-request accept
+        ip6 nexthdr icmpv6 accept
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+NFTEOF'; "
     fi
 
-    # 构建内核参数
-    local kernel_params=""
-
-    # 基础安装器参数
-    kernel_params+="auto=true priority=critical"
-    kernel_params+=" preseed/file=/preseed.cfg"
-    kernel_params+=" locale=en_US.UTF-8"
-    kernel_params+=" keymap=us"
-    kernel_params+=" hostname=${HOSTNAME_NEW}"
-    kernel_params+=" domain=unassigned-domain"
-
-    # 网络内核参数
-    # 使用内核参数静态配置网络，防止安装器 DHCP 覆盖
-    if [[ "$NET_MODE" == "ipv4" || "$NET_MODE" == "dual" ]]; then
-        kernel_params+=" netcfg/disable_autoconfig=true"
-        kernel_params+=" netcfg/get_ipaddress=${IPV4_ADDR}"
-        kernel_params+=" netcfg/get_netmask=${IPV4_MASK}"
-        kernel_params+=" netcfg/get_gateway=${IPV4_GW}"
-        kernel_params+=" netcfg/get_nameservers=${DNS_SERVERS%% *}"
-        kernel_params+=" netcfg/confirm_static=true"
+    # Fail2ban
+    if [[ "$INSTALL_FAIL2BAN" == "yes" ]]; then
+        late_commands+="in-target apt-get install -y fail2ban; "
+        late_commands+="in-target systemctl enable fail2ban; "
+        # 自定义 fail2ban SSH 配置
+        late_commands+="in-target sh -c 'cat > /etc/fail2ban/jail.local << \"F2BEOF\"
+[sshd]
+enabled = true
+port = ${SSH_PORT}
+filter = sshd
+maxretry = 5
+bantime = 3600
+findtime = 600
+F2BEOF'; "
     fi
 
-    if [[ "$NET_MODE" == "ipv6" ]]; then
-        kernel_params+=" netcfg/disable_autoconfig=true"
-        kernel_params+=" netcfg/get_ipaddress=${IPV6_ADDR}"
-        kernel_params+=" netcfg/get_netmask=${IPV6_PREFIX}"
-        kernel_params+=" netcfg/get_gateway=${IPV6_GW}"
-        kernel_params+=" netcfg/get_nameservers=${DNS_SERVERS%% *}"
-        kernel_params+=" netcfg/confirm_static=true"
+    # 自动安全更新
+    late_commands+="in-target apt-get install -y unattended-upgrades; "
+    late_commands+="in-target dpkg-reconfigure -f noninteractive unattended-upgrades; "
+
+    # 生成 preseed 文件
+    cat > "${PRESEED_FILE}" << PRESEEDEOF
+### —— 语言和地区 ——
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+
+### —— 网络配置（静态 IP）——
+d-i netcfg/choose_interface select ${NET_IFACE}
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/get_ipaddress string ${NET_IP}
+d-i netcfg/get_netmask string ${NET_MASK}
+d-i netcfg/get_gateway string ${NET_GW}
+d-i netcfg/get_nameservers string ${NET_DNS1}
+d-i netcfg/confirm_static boolean true
+d-i netcfg/get_hostname string debian
+d-i netcfg/get_domain string localdomain
+
+### —— 镜像源 ——
+d-i mirror/protocol string http
+d-i mirror/country string manual
+d-i mirror/http/hostname string $(echo "${SELECTED_MIRROR}" | sed 's|https\?://||' | cut -d/ -f1)
+d-i mirror/http/directory string /$(echo "${SELECTED_MIRROR}" | sed 's|https\?://[^/]*/||')
+d-i mirror/http/proxy string
+
+### —— 时区 ——
+d-i time/zone string ${TIMEZONE}
+d-i clock-setup/utc boolean true
+d-i clock-setup/ntp boolean true
+
+### —— 用户账号（仅 root）——
+d-i passwd/root-login boolean true
+d-i passwd/make-user boolean false
+d-i passwd/root-password-crypted string ${root_pw_hash}
+
+### —— 安装后执行的命令 ——
+d-i preseed/late_command string ${late_commands}
+
+### —— 结束后重启 ——
+d-i finish-install/reboot_in_progress note
+PRESEEDEOF
+
+    chmod 600 "${PRESEED_FILE}"
+    msg_ok "Preseed 配置文件已生成: ${PRESEED_FILE}"
+    msg_info "提示: 磁盘分区部分未预配置，将在 VNC 中手动操作。"
+}
+
+#——————————————————————————————————————————————
+# 第 7 步：配置 GRUB 引导
+#——————————————————————————————————————————————
+configure_grub() {
+    msg_step "第 7 步：配置 GRUB 引导"
+
+    # 备份当前 40_custom
+    if [[ -f "${GRUB_CUSTOM}" ]]; then
+        cp "${GRUB_CUSTOM}" "${GRUB_CUSTOM_BACKUP}"
+        msg_ok "已备份 GRUB 配置: ${GRUB_CUSTOM_BACKUP}"
     fi
 
-    kernel_params+=" netcfg/choose_interface=${NET_IFACE}"
+    # 获取根分区 UUID
+    local root_dev root_uuid
+    root_dev=$(findmnt -n -o SOURCE /)
+    root_uuid=$(blkid -s UUID -o value "$root_dev")
 
-    # VGA console（方便 VNC 查看）
-    kernel_params+=" vga=788"
-    kernel_params+=" --- quiet"
-
-    # 移除旧的 netboot 条目（幂等）
-    if [[ -f "$GRUB_CUSTOM" ]]; then
-        # 删除旧的 debian-netboot-installer 条目
-        local tmp_grub
-        tmp_grub=$(mktemp)
-        awk '
-            /menuentry.*--id '"'${GRUB_MENUENTRY_ID}'"'/{skip=1; brace=0}
-            skip && /\{/{brace++}
-            skip && /\}/{brace--; if(brace<=0){skip=0; next}}
-            !skip
-        ' "$GRUB_CUSTOM" > "$tmp_grub"
-        mv "$tmp_grub" "$GRUB_CUSTOM"
+    if [[ -z "$root_uuid" ]]; then
+        msg_error "无法获取根分区 UUID！"
+        exit 1
     fi
+    msg_ok "根分区: ${root_dev}  UUID: ${root_uuid}"
 
-    # 确保 40_custom 有正确的头部
-    if [[ ! -f "$GRUB_CUSTOM" ]] || ! grep -q 'exec tail' "$GRUB_CUSTOM"; then
-        cat > "$GRUB_CUSTOM" << 'HEADER'
-#!/bin/sh
-exec tail -n +3 $0
-# This file provides an easy way to add custom menu entries.
-HEADER
-    fi
+    # 构建内核启动参数
+    local linux_params="auto=true priority=critical"
+    linux_params+=" preseed/file=/netboot/preseed.cfg"
+    linux_params+=" netcfg/choose_interface=${NET_IFACE}"
+    linux_params+=" netcfg/disable_autoconfig=true"
+    linux_params+=" netcfg/get_ipaddress=${NET_IP}"
+    linux_params+=" netcfg/get_netmask=${NET_MASK}"
+    linux_params+=" netcfg/get_gateway=${NET_GW}"
+    linux_params+=" netcfg/get_nameservers=${NET_DNS1}"
+    linux_params+=" netcfg/confirm_static=true"
+    linux_params+=" locale=en_US.UTF-8"
+    linux_params+=" keyboard-configuration/xkb-keymap=us"
+    linux_params+=" --- quiet"
 
-    # 写入新的 netboot 条目
-    cat >> "$GRUB_CUSTOM" << GRUBEOF
-
-menuentry 'Debian ${DEBIAN_VERSION} (${DEBIAN_CODENAME}) Netboot Installer' --id '${GRUB_MENUENTRY_ID}' {
-    insmod gzio
+    # 根据 BIOS/UEFI 选择不同的 GRUB 配置
+    local grub_entry=""
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        grub_entry="
+menuentry \">>> Netboot Debian ${DEBIAN_VERSION} Installer (${DEBIAN_ARCH}) <<<\" --class debian --class installer {
+    insmod part_gpt
+    insmod ext2
+    insmod search_fs_uuid
+    search --no-floppy --fs-uuid --set=root ${root_uuid}
+    echo '正在加载 Debian 安装器...'
+    linux /netboot/linux ${linux_params}
+    initrd /netboot/initrd.gz
+}"
+    else
+        grub_entry="
+menuentry \">>> Netboot Debian ${DEBIAN_VERSION} Installer (${DEBIAN_ARCH}) <<<\" --class debian --class installer {
+    insmod mdraid1x
     insmod part_msdos
     insmod part_gpt
-    linux  /boot/debian-netboot/vmlinuz ${kernel_params}
-    initrd /boot/debian-netboot/initrd.gz
-}
-GRUBEOF
+    insmod ext2
+    insmod search_fs_uuid
+    search --no-floppy --fs-uuid --set=root ${root_uuid}
+    echo '正在加载 Debian 安装器...'
+    linux /netboot/linux ${linux_params}
+    initrd /netboot/initrd.gz
+}"
+    fi
 
-    chmod +x "$GRUB_CUSTOM"
+    # 写入 GRUB
+    echo "${grub_entry}" >> "${GRUB_CUSTOM}"
+    msg_ok "GRUB 菜单项已添加"
+
+    # 设置 GRUB 超时，让用户在 VNC 中可以选择
+    if [[ -f /etc/default/grub ]]; then
+        sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=30/' /etc/default/grub
+        sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub
+        # 如果没有这些行就添加
+        grep -q '^GRUB_TIMEOUT=' /etc/default/grub || echo 'GRUB_TIMEOUT=30' >> /etc/default/grub
+        grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub
+    fi
 
     # 更新 GRUB
-    log_info "更新 GRUB 配置 ..."
-    update-grub 2>&1 | tee -a "$LOG_FILE" || die "update-grub 失败！请检查 GRUB 配置"
-
-    # 验证条目存在
-    if ! grep -q "${GRUB_MENUENTRY_ID}" /boot/grub/grub.cfg 2>/dev/null; then
-        die "GRUB 配置更新后未找到 netboot 条目。请检查 ${GRUB_CUSTOM}"
-    fi
-
-    # 使用 grub-reboot 设置一次性启动
-    log_info "设置下一次启动进入安装器 (grub-reboot) ..."
-    grub-reboot "${GRUB_MENUENTRY_ID}" || die "grub-reboot 失败"
-
-    log_info "GRUB 配置完成 ✓"
-    echo ""
-    echo "  ℹ 取消下次启动进入安装器的方法:"
-    echo "    sudo grub-reboot 0"
-    echo "    # 这会将下次启动恢复为默认条目"
-    echo ""
+    msg_info "正在更新 GRUB..."
+    update-grub 2>&1 | grep -v "^$" || grub-mkconfig -o /boot/grub/grub.cfg 2>&1
+    msg_ok "GRUB 已更新"
 }
 
-# =============================================================================
-# 第七阶段：摘要确认和重启
-# =============================================================================
-show_summary_and_confirm() {
-    log_step "最终摘要"
+#——————————————————————————————————————————————
+# 第 8 步：汇总信息并确认重启
+#——————————————————————————————————————————————
+show_summary_and_reboot() {
+    msg_step "第 8 步：配置汇总"
 
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                     安 装 摘 要                             ║"
-    echo "╠══════════════════════════════════════════════════════════════╣"
-    echo "║"
-    echo "║  Debian 版本:    ${DEBIAN_VERSION} (${DEBIAN_CODENAME})"
-    echo "║  启动模式:       ${BOOT_MODE^^}"
-    echo "║"
-    echo "║  ─── 网络配置 ───"
-    echo "║  网络模式:       ${NET_MODE}"
-    echo "║  网络接口:       ${NET_IFACE}"
-    if [[ "$NET_MODE" == "ipv4" || "$NET_MODE" == "dual" ]]; then
-        echo "║  IPv4 地址:      ${IPV4_ADDR}"
-        echo "║  IPv4 掩码:      ${IPV4_MASK}"
-        echo "║  IPv4 网关:      ${IPV4_GW}"
-    fi
-    if [[ "$NET_MODE" == "ipv6" || "$NET_MODE" == "dual" ]]; then
-        echo "║  IPv6 地址:      ${IPV6_ADDR}"
-        echo "║  IPv6 前缀:      ${IPV6_PREFIX}"
-        echo "║  IPv6 网关:      ${IPV6_GW}"
-    fi
-    echo "║  DNS:            ${DNS_SERVERS}"
-    echo "║  Hostname:       ${HOSTNAME_NEW}"
-    echo "║"
-    echo "║  ─── 账户 ───"
-    if [[ "$USER_STRATEGY" == "root_only" ]]; then
-        echo "║  用户策略:       仅 root"
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║              系统重装配置汇总                           ║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}║${NC} 引导方式:     ${GREEN}${BOOT_MODE}${NC}"
+    echo -e "${BOLD}║${NC} 安装版本:     ${GREEN}Debian ${DEBIAN_VERSION} (${DEBIAN_ARCH})${NC}"
+    echo -e "${BOLD}║${NC} 镜像源:       ${GREEN}${SELECTED_MIRROR}${NC}"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}║${NC} ${CYAN}—— 网络配置 ——${NC}"
+    echo -e "${BOLD}║${NC} 网卡:         ${NET_IFACE}"
+    echo -e "${BOLD}║${NC} IPv4:         ${NET_IP}/${NET_CIDR}"
+    echo -e "${BOLD}║${NC} 网关:         ${NET_GW}"
+    echo -e "${BOLD}║${NC} DNS:          ${NET_DNS1}, ${NET_DNS2}"
+    [[ "$HAS_IPV6" == "yes" ]] && echo -e "${BOLD}║${NC} IPv6:         ${NET_IP6}"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}║${NC} ${CYAN}—— SSH 配置 ——${NC}"
+    echo -e "${BOLD}║${NC} SSH 端口:     ${SSH_PORT}"
+    echo -e "${BOLD}║${NC} 密钥登录:     ${USE_SSH_KEY}"
+    echo -e "${BOLD}║${NC} 禁用密码:     ${DISABLE_PASSWORD_AUTH}"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}║${NC} ${CYAN}—— 安全配置 ——${NC}"
+    echo -e "${BOLD}║${NC} 防火墙:       ${SETUP_FIREWALL}"
+    echo -e "${BOLD}║${NC} Fail2ban:     ${INSTALL_FAIL2BAN}"
+    echo -e "${BOLD}║${NC} 自动更新:     yes"
+    echo -e "${BOLD}║${NC} 时区:         ${TIMEZONE}"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}║${NC} ${CYAN}—— 文件校验 ——${NC}"
+    echo -e "${BOLD}║${NC} SHA256:       已验证 ✓"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}║${NC}  ${YELLOW}重启后操作步骤：${NC}"
+    echo -e "${BOLD}║${NC}  1. 通过 VNC 连接服务器"
+    echo -e "${BOLD}║${NC}  2. 在 GRUB 菜单中选择 >>> Netboot Debian ... <<<"
+    echo -e "${BOLD}║${NC}  3. 安装器会自动配置网络"
+    echo -e "${BOLD}║${NC}  4. 手动选择磁盘分区方案"
+    echo -e "${BOLD}║${NC}  5. 完成安装后系统将自动配置 SSH、防火墙等"
+    echo -e "${BOLD}║${NC}"
+    echo -e "${BOLD}║${NC}  ${GREEN}安装完成后使用以下信息连接：${NC}"
+    echo -e "${BOLD}║${NC}  ssh -p ${SSH_PORT} root@${NET_IP}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 保存汇总到文件
+    cat > "${NETBOOT_DIR}/INSTALL_INFO.txt" << INFOEOF
+===== Debian Netboot 重装信息 =====
+日期: $(date)
+引导方式: ${BOOT_MODE}
+安装版本: Debian ${DEBIAN_VERSION} (${DEBIAN_ARCH})
+
+== 网络 ==
+IP: ${NET_IP}/${NET_CIDR}
+网关: ${NET_GW}
+DNS: ${NET_DNS1}, ${NET_DNS2}
+
+== SSH 连接 ==
+命令: ssh -p ${SSH_PORT} root@${NET_IP}
+密钥登录: ${USE_SSH_KEY}
+
+== 安全 ==
+防火墙端口: ${SSH_PORT}/tcp
+Fail2ban: ${INSTALL_FAIL2BAN}
+================================
+INFOEOF
+    msg_ok "连接信息已保存到 ${NETBOOT_DIR}/INSTALL_INFO.txt"
+
+    echo ""
+    msg_warn "======================================================"
+    msg_warn "  即将重启系统！重启后请立即通过 VNC 连接！"
+    msg_warn "======================================================"
+    echo ""
+
+    read -rp "$(echo -e "${RED}${BOLD}输入 YES 确认重启（其他任何输入将取消）: ${NC}")" reboot_confirm
+    if [[ "$reboot_confirm" == "YES" ]]; then
+        msg_info "系统将在 5 秒后重启..."
+        sleep 5
+        reboot
     else
-        echo "║  用户策略:       root + ${NORMAL_USER}"
-    fi
-    echo "║"
-    echo "║  ─── SSH ───"
-    echo "║  SSH 端口:       ${SSH_PORT}"
-    if [[ "$SSH_ROOT_POLICY" == "pubkey_only" ]]; then
-        echo "║  Root 登录:      仅公钥（禁止密码）"
-        echo "║  已添加公钥:     是"
-    else
-        echo "║  Root 登录:      允许密码"
-        echo "║  已添加公钥:     否"
-    fi
-    echo "║"
-    echo "║  ─── 内核 ───"
-    if [[ "$INSTALL_CLOUD_KERNEL" == "yes" ]]; then
-        echo "║  Cloud 内核:     是"
-        if [[ "$ENABLE_BACKPORTS" == "yes" ]]; then
-            echo "║  Backports:      是（仅用于 cloud 内核）"
-        else
-            echo "║  Backports:      否"
-        fi
-    else
-        echo "║  Cloud 内核:     否（使用默认内核）"
-        echo "║  Backports:      否"
-    fi
-    echo "║"
-    echo "║  ─── 重要提醒 ───"
-    echo "║  • 分区将在 VNC 中手动完成"
-    echo "║  • Bootloader 安装目标将在 VNC 中手动确认"
-    echo "║  • 重启后请立即连接 VNC 完成安装"
-    echo "║  • 下次启动将一次性进入安装器"
-    echo "║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo ""
-
-    if [[ "$NET_MODE" == "ipv6" || "$NET_MODE" == "dual" ]]; then
-        echo "  ⚠ 警告: Debian installer 对 IPv6 preseed 支持有限。"
-        echo "    IPv6 配置可能需要在 VNC 安装过程中手动确认或修改。"
-        echo ""
-    fi
-
-    echo "════════════════════════════════════════════════"
-    echo "  重启后将进入 Debian 安装器。"
-    echo "  如需取消: sudo grub-reboot 0"
-    echo "════════════════════════════════════════════════"
-    echo ""
-    echo -n "确认重启？请输入大写 YES 继续，其他任何输入将安全退出: "
-    local confirm
-    read -r confirm
-
-    if [[ "$confirm" != "YES" ]]; then
-        echo ""
-        log_info "用户取消了重启。"
-        echo "  GRUB 配置已写入但未重启。你可以："
-        echo "    1. 手动重启:  sudo reboot"
-        echo "    2. 取消安装:  sudo grub-reboot 0"
-        echo "    3. 重新运行本脚本"
-        echo ""
-        exit 0
-    fi
-
-    echo ""
-    log_info "即将重启 ..."
-    echo "  请立即准备好 VNC 连接！"
-    echo "  5 秒后重启 ..."
-    sleep 5
-    reboot
-}
-
-# =============================================================================
-# 清理函数
-# =============================================================================
-cleanup_sensitive() {
-    # 清除内存中的敏感变量
-    ROOT_PW_HASH=""
-    USER_PW_HASH=""
-    SSH_PUBKEYS=""
-
-    # 确保日志中没有密码哈希
-    if [[ -f "$LOG_FILE" ]]; then
-        chmod 600 "$LOG_FILE"
+        msg_info "已取消重启。"
+        msg_info "你可以稍后手动执行 reboot 来启动安装。"
+        msg_info "在 GRUB 菜单中选择 '>>> Netboot Debian ...' 项即可。"
     fi
 }
 
-# =============================================================================
-# 主函数
-# =============================================================================
+#——————————————————————————————————————————————
+# 主流程
+#——————————————————————————————————————————————
 main() {
-    # 初始化日志
-    touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" || true
-
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║     Debian Netboot 重装准备脚本 v${SCRIPT_VERSION}                     ║"
-    echo "║     仅准备环境，不做全自动安装                                ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║        Debian Netboot 一键重装脚本 v1.0                 ║${NC}"
+    echo -e "${BOLD}║        支持 BIOS / UEFI 自动检测                       ║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    # 阶段一：前置检查
-    log_step "环境检查"
-    check_root
-    check_os
-    detect_boot_mode
-    detect_download_tool
-    install_dependencies
-
-    # 阶段二：检测网络
-    detect_network
-
-    # 阶段三：用户交互
-    choose_debian_version
-    configure_network_interactive
-    configure_accounts
-    configure_ssh
-    configure_kernel
-
-    # 阶段四：下载
-    download_netboot_files
-
-    # 阶段五：生成 preseed
-    generate_preseed
-
-    # 阶段五 B：将 preseed 嵌入 initrd
-    repack_initrd
-
-    # 阶段六：GRUB
-    configure_grub
-
-    # 阶段七：确认和重启
-    show_summary_and_confirm
-
-    # 清理（正常情况下 reboot 后不会到达这里）
-    cleanup_sensitive
+    preflight_check        # 环境检查
+    detect_boot_mode       # BIOS/UEFI 检测
+    detect_network         # 网络配置获取
+    user_config            # 用户交互配置
+    download_and_verify    # 下载+校验
+    generate_preseed       # 生成 preseed
+    configure_grub         # 配置 GRUB
+    show_summary_and_reboot # 汇总+重启
 }
 
-# 注册退出清理
-trap cleanup_sensitive EXIT
-
-# 运行
 main "$@"
