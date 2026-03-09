@@ -30,9 +30,6 @@ PUBKEY_TEXT="${PUBKEY_TEXT:-}"
 # yes = 尝试设置下次启动只进入安装器，并立即重启；no = 只准备环境，不自动重启
 AUTO_REBOOT="${AUTO_REBOOT:-no}"
 
-# 向导模式：yes = 强制交互向导；no = 跳过向导（依赖环境变量）；auto = 终端时显示向导
-WIZARD_MODE="${WIZARD_MODE:-auto}"
-
 # ======================================================
 
 # ---------- 日志函数 ----------
@@ -44,6 +41,80 @@ step() { printf '\n\033[1;36m──── %s ────\033[0m\n' "$*"; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+}
+
+# ---------- 自动安装依赖 ----------
+# 命令 → 包名映射
+declare -A CMD_PKG_MAP=(
+  [awk]=gawk
+  [sed]=sed
+  [grep]=grep
+  [ip]=iproute2
+  [findmnt]=util-linux
+  [blkid]=util-linux
+  [sha256sum]=coreutils
+  [gpgv]=gpgv
+  [grub-probe]=grub-common
+  [cpio]=cpio
+  [gzip]=gzip
+  [base64]=coreutils
+  [curl]=curl
+  [openssl]=openssl
+  [hostname]=hostname
+  [find]=findutils
+)
+
+install_dependencies() {
+  step "检查并安装依赖"
+
+  local missing_pkgs=()
+  local missing_cmds=()
+
+  for cmd in "${!CMD_PKG_MAP[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      local pkg="${CMD_PKG_MAP[$cmd]}"
+      missing_cmds+=("$cmd")
+      # 去重：检查 pkg 是否已在 missing_pkgs 中
+      local already=0
+      if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+        for p in "${missing_pkgs[@]}"; do
+          [[ "$p" == "$pkg" ]] && already=1 && break
+        done
+      fi
+      (( already )) || missing_pkgs+=("$pkg")
+    fi
+  done
+
+  # debian-archive-keyring 不是命令而是文件，单独检查
+  if ! find_debian_keyring >/dev/null 2>&1; then
+    missing_pkgs+=("debian-archive-keyring")
+  fi
+
+  if [[ ${#missing_pkgs[@]} -eq 0 ]]; then
+    log "所有依赖已满足"
+    return 0
+  fi
+
+  warn "缺少以下软件包: ${missing_pkgs[*]}"
+  if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+    info "对应缺少的命令: ${missing_cmds[*]}"
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    die "本脚本仅支持 Debian/Ubuntu 系统（apt-get），请手动安装: ${missing_pkgs[*]}"
+  fi
+
+  log "正在更新包索引并安装依赖…"
+  export DEBIAN_FRONTEND=noninteractive
+  run apt-get update -qq
+  run apt-get install -y -qq "${missing_pkgs[@]}"
+
+  # 安装后再次验证
+  for cmd in "${missing_cmds[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || die "安装后仍找不到命令: $cmd（包 ${CMD_PKG_MAP[$cmd]}）"
+  done
+
+  log "依赖安装完成"
 }
 
 cleanup() {
@@ -153,26 +224,36 @@ hash_password_sha512() {
   fi
   if command -v python3 >/dev/null 2>&1; then
     python3 - <<'PY' "$pw"
-import crypt, secrets, sys
+import secrets, subprocess, sys
 pw = sys.argv[1]
-salt = "$6$" + secrets.token_urlsafe(12)
-print(crypt.crypt(pw, salt))
+salt = secrets.token_hex(8)
+# 优先 crypt 模块（Python < 3.13），否则回退 openssl 子进程
+try:
+    import crypt as _c
+    print(_c.crypt(pw, "$6$" + salt))
+except (ImportError, ModuleNotFoundError):
+    r = subprocess.run(["openssl", "passwd", "-6", "-salt", salt, pw],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        print(r.stdout.strip())
+    else:
+        sys.exit(1)
 PY
     return 0
   fi
   die "无法生成 SHA-512 密码哈希，请安装 openssl / whois(mkpasswd) / python3"
 }
 
-# ---------- 下载函数（优先 HTTPS） ----------
+# ---------- 下载函数（强制 HTTPS + TLS 1.2） ----------
 download() {
   local url="${1:?}" out="${2:?}"
   if command -v curl >/dev/null 2>&1; then
-    run curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$out"
+    run curl -fsSL -4 --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 "$url" -o "$out"
   elif command -v wget >/dev/null 2>&1; then
-    run wget -4 --https-only -O "$out" "$url" 2>/dev/null || \
-    run wget -4 -O "$out" "$url"
+    run wget -4 --https-only -q -O "$out" "$url" 2>/dev/null || \
+    run wget -4 -q -O "$out" "$url"
   else
-    die "缺少 curl 或 wget"
+    die "缺少 curl 或 wget，请先安装: apt-get install -y curl"
   fi
 }
 
@@ -436,6 +517,7 @@ confirm_proceed() {
 find_debian_keyring() {
   local candidates=(
     /usr/share/keyrings/debian-archive-keyring.gpg
+    /etc/apt/trusted.gpg.d/debian-archive-trixie-stable.gpg
     /etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.gpg
     /etc/apt/trusted.gpg.d/debian-archive-bullseye-stable.gpg
     /etc/apt/trusted.gpg
@@ -778,19 +860,7 @@ print_summary() {
 main() {
   banner
   require_root
-
-  need_cmd awk
-  need_cmd sed
-  need_cmd grep
-  need_cmd ip
-  need_cmd findmnt
-  need_cmd blkid
-  need_cmd sha256sum
-  need_cmd gpgv
-  need_cmd grub-probe
-  need_cmd cpio
-  need_cmd gzip
-  need_cmd base64
+  install_dependencies
 
   WORKDIR="$(mktemp -d /tmp/debian-netboot-reinstall.XXXXXX)"
 
