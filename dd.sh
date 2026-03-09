@@ -14,11 +14,11 @@ GRUB_SCRIPT="${GRUB_SCRIPT:-/etc/grub.d/09_reinstall_debian_netboot}"
 MENU_TITLE="${MENU_TITLE:-}"
 
 # 网络模式：auto-copy（复制当前IPv4为静态）、dhcp（安装器里走DHCP）、manual（手填静态）
-NETWORK_MODE="${NETWORK_MODE:-auto-copy}"
+NETWORK_MODE="${NETWORK_MODE:-}"
 
 # SSH 认证模式：password / key-only / both
-SSH_AUTH_MODE="${SSH_AUTH_MODE:-key-only}"
-SSH_PORT="${SSH_PORT:-2222}"
+SSH_AUTH_MODE="${SSH_AUTH_MODE:-}"
+SSH_PORT="${SSH_PORT:-}"
 
 # root 密码：建议不要直接写到脚本里，留空时脚本会安全提示输入
 ROOT_PASSWORD="${ROOT_PASSWORD:-}"
@@ -30,20 +30,17 @@ PUBKEY_TEXT="${PUBKEY_TEXT:-}"
 # yes = 尝试设置下次启动只进入安装器，并立即重启；no = 只准备环境，不自动重启
 AUTO_REBOOT="${AUTO_REBOOT:-no}"
 
+# 向导模式：yes = 强制交互向导；no = 跳过向导（依赖环境变量）；auto = 终端时显示向导
+WIZARD_MODE="${WIZARD_MODE:-auto}"
+
 # ======================================================
 
-log() {
-  printf '[+] %s\n' "$*"
-}
-
-warn() {
-  printf '[!] %s\n' "$*" >&2
-}
-
-die() {
-  printf '[x] %s\n' "$*" >&2
-  exit 1
-}
+# ---------- 日志函数 ----------
+log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m[i]\033[0m %s\n' "$*"; }
+step() { printf '\n\033[1;36m──── %s ────\033[0m\n' "$*"; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
@@ -56,26 +53,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run() {
-  "$@"
+run()  { "$@"; }
+trim() { awk '{$1=$1;print}' <<<"$*"; }
+
+# ---------- 欢迎横幅 ----------
+banner() {
+  cat <<'BANNER'
+
+  ╔══════════════════════════════════════════════════════════════╗
+  ║         Debian Netboot 一键重装脚本  v2.0                   ║
+  ║                                                              ║
+  ║  本脚本将引导您完成以下操作：                               ║
+  ║  1. 检测并配置网络（安装器使用的 IP/网关/DNS）              ║
+  ║  2. 设置安装后 root 密码                                     ║
+  ║  3. 配置 SSH 端口与登录策略                                  ║
+  ║  4. 下载并校验 Debian 安装器文件（防篡改）                  ║
+  ║  5. 将安装项写入 GRUB，您通过 VNC 手动完成后续安装          ║
+  ║                                                              ║
+  ║  ⚠  运行后需重启，请务必提前打开 VNC！                     ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+BANNER
 }
 
-trim() {
-  awk '{$1=$1;print}' <<<"$*"
-}
-
+# ---------- Debian 版本选择 ----------
 resolve_debian_release() {
   local release_input="${DEBIAN_RELEASE:-${DEBIAN_CODENAME:-}}"
 
   if [[ -z "$release_input" && -t 0 ]]; then
-    echo "请选择要安装的 Debian 版本："
-    echo "  1) Debian 12 (bookworm)"
-    echo "  2) Debian 13 (trixie，当前 stable)"
-    read -r -p "请输入 12 或 13 [13]: " release_input
-    release_input="${release_input:-13}"
+    step "选择 Debian 版本"
+    echo "  1) Debian 12 (bookworm)  — 当前 stable，稳定成熟"
+    echo "  2) Debian 13 (trixie)    — 较新，功能更多"
+    echo ""
+    read -r -p "请输入 1 或 2 [默认 1]: " _choice
+    case "${_choice:-1}" in
+      2) release_input="13" ;;
+      *) release_input="12" ;;
+    esac
   fi
 
-  release_input="$(printf '%s' "$release_input" | tr '[:upper:]' '[:lower:]')"
+  release_input="$(printf '%s' "${release_input:-12}" | tr '[:upper:]' '[:lower:]')"
 
   case "$release_input" in
     12|bookworm)
@@ -87,19 +104,21 @@ resolve_debian_release() {
       DEBIAN_CODENAME="trixie"
       ;;
     "")
-      DEBIAN_VERSION="13"
-      DEBIAN_CODENAME="trixie"
+      DEBIAN_VERSION="12"
+      DEBIAN_CODENAME="bookworm"
       ;;
     *)
-      die "DEBIAN_RELEASE 仅支持 12 / 13 / bookworm / trixie / stable"
+      die "DEBIAN_RELEASE 仅支持 12 / 13 / bookworm / trixie"
       ;;
   esac
 
   if [[ -z "$MENU_TITLE" ]]; then
     MENU_TITLE="Netboot Debian ${DEBIAN_VERSION} (${DEBIAN_CODENAME}) Installer ${DEBIAN_ARCH}"
   fi
+  log "已选择 Debian $DEBIAN_VERSION ($DEBIAN_CODENAME)"
 }
 
+# ---------- 子网掩码转换 ----------
 prefix_to_netmask() {
   local p="${1:?}"
   local mask=""
@@ -121,6 +140,7 @@ prefix_to_netmask() {
   printf '%s\n' "$mask"
 }
 
+# ---------- 密码哈希 ----------
 hash_password_sha512() {
   local pw="${1:?}"
   if command -v openssl >/dev/null 2>&1; then
@@ -143,33 +163,40 @@ PY
   die "无法生成 SHA-512 密码哈希，请安装 openssl / whois(mkpasswd) / python3"
 }
 
+# ---------- 下载函数（优先 HTTPS） ----------
 download() {
   local url="${1:?}" out="${2:?}"
   if command -v curl >/dev/null 2>&1; then
     run curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$out"
   elif command -v wget >/dev/null 2>&1; then
+    run wget -4 --https-only -O "$out" "$url" 2>/dev/null || \
     run wget -4 -O "$out" "$url"
   else
     die "缺少 curl 或 wget"
   fi
 }
 
+# ---------- 权限检查 ----------
 require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行"
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 用户运行此脚本（sudo bash dd.sh）"
 }
 
+# ---------- 密码输入 ----------
 read_secret_twice() {
   local p1 p2
   while true; do
-    read -r -s -p "请输入安装后 root 密码: " p1; echo
-    read -r -s -p "请再次输入安装后 root 密码: " p2; echo
-    [[ -n "$p1" ]] || { warn "密码不能为空"; continue; }
+    read -r -s -p "  请输入安装后 root 密码（不显示）: " p1; echo
+    [[ -n "$p1" ]] || { warn "密码不能为空，请重新输入"; continue; }
+    [[ ${#p1} -ge 8 ]] || { warn "密码至少需要 8 位，请重新输入"; continue; }
+    read -r -s -p "  请再次输入确认密码: " p2; echo
     [[ "$p1" == "$p2" ]] || { warn "两次输入不一致，请重试"; continue; }
     ROOT_PASSWORD="$p1"
+    log "密码已设置"
     break
   done
 }
 
+# ---------- 公钥收集 ----------
 collect_pubkey() {
   case "$SSH_AUTH_MODE" in
     password)
@@ -190,6 +217,7 @@ collect_pubkey() {
   if [[ -n "$PUBKEY_FILE" ]]; then
     [[ -f "$PUBKEY_FILE" ]] || die "找不到公钥文件: $PUBKEY_FILE"
     PUBKEY_TEXT="$(<"$PUBKEY_FILE")"
+    log "已读取公钥文件: $PUBKEY_FILE"
     return 0
   fi
 
@@ -200,15 +228,19 @@ collect_pubkey() {
   fi
 
   if [[ -t 0 ]]; then
-    echo "未找到公钥。你可以粘贴一整行 SSH 公钥（ssh-ed25519 / ssh-rsa 开头）。"
-    read -r -p "若不需要公钥，请按 Ctrl+C 退出后改用 SSH_AUTH_MODE=password：" PUBKEY_TEXT
-    [[ -n "$PUBKEY_TEXT" ]] || die "未提供公钥"
+    echo ""
+    info "未找到公钥文件。"
+    info "请粘贴您的 SSH 公钥（以 ssh-ed25519 或 ssh-rsa 开头的一整行）。"
+    info "若您还没有公钥，请按 Ctrl+C 退出，改用密码模式（SSH_AUTH_MODE=password）。"
+    read -r -p "  粘贴公钥: " PUBKEY_TEXT
+    [[ -n "$PUBKEY_TEXT" ]] || die "未提供公钥，请重新运行并选择 password 模式"
     return 0
   fi
 
   die "当前模式需要公钥，但未提供 PUBKEY_FILE / PUBKEY_TEXT，且 /root/.ssh/authorized_keys 不存在"
 }
 
+# ---------- 网络检测 ----------
 detect_network() {
   DETECT_IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
   DETECT_GATEWAY="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
@@ -229,28 +261,62 @@ detect_network() {
     DETECT_PREFIX="${DETECT_CIDR#*/}"
     DETECT_NETMASK="$(prefix_to_netmask "$DETECT_PREFIX")"
   fi
-
-  log "当前网络检测结果："
-  printf '    网卡: %s\n' "${DETECT_IFACE:-<未识别>}"
-  printf '    IPv4: %s\n' "${DETECT_IP:-<未识别>}"
-  printf '    掩码: %s\n' "${DETECT_NETMASK:-<未识别>}"
-  printf '    网关: %s\n' "${DETECT_GATEWAY:-<未识别>}"
-  printf '    DNS : %s\n' "${DETECT_DNS:-<未识别>}"
-  printf '    主机名: %s\n' "${DETECT_HOSTNAME:-debian}"
-  printf '    域名  : %s\n' "${DETECT_DOMAIN:-localdomain}"
 }
 
+show_detected_network() {
+  step "当前网络信息检测结果"
+  printf '  %-10s %s\n' "网卡:"    "${DETECT_IFACE:-<未识别>}"
+  printf '  %-10s %s\n' "IPv4:"    "${DETECT_IP:-<未识别>}"
+  printf '  %-10s %s\n' "子网掩码:" "${DETECT_NETMASK:-<未识别>}"
+  printf '  %-10s %s\n' "网关:"    "${DETECT_GATEWAY:-<未识别>}"
+  printf '  %-10s %s\n' "DNS:"     "${DETECT_DNS:-<未识别>}"
+  printf '  %-10s %s\n' "主机名:"  "${DETECT_HOSTNAME:-debian}"
+  printf '  %-10s %s\n' "域名:"    "${DETECT_DOMAIN:-localdomain}"
+  echo ""
+}
+
+# ---------- 网络模式选择 ----------
 choose_network() {
+  # 若未通过环境变量指定，则在向导中交互选择
+  if [[ -z "$NETWORK_MODE" && -t 0 ]]; then
+    step "选择安装器网络配置方式"
+    if [[ -n "${DETECT_IP:-}" && -n "${DETECT_NETMASK:-}" && -n "${DETECT_GATEWAY:-}" ]]; then
+      echo "  1) 自动复制当前静态 IP（推荐：${DETECT_IP}/${DETECT_PREFIX} 网关${DETECT_GATEWAY}）"
+      echo "  2) 使用 DHCP 自动获取（安装器从 DHCP 获取 IP）"
+      echo "  3) 手动填写静态 IP"
+      echo ""
+      read -r -p "请选择 [默认 1]: " _nc
+      case "${_nc:-1}" in
+        2) NETWORK_MODE="dhcp" ;;
+        3) NETWORK_MODE="manual" ;;
+        *) NETWORK_MODE="auto-copy" ;;
+      esac
+    else
+      warn "未能自动识别当前 IP，只能选择 DHCP 或手动填写"
+      echo "  1) 使用 DHCP 自动获取"
+      echo "  2) 手动填写静态 IP"
+      echo ""
+      read -r -p "请选择 [默认 1]: " _nc
+      case "${_nc:-1}" in
+        2) NETWORK_MODE="manual" ;;
+        *) NETWORK_MODE="dhcp" ;;
+      esac
+    fi
+  fi
+
+  NETWORK_MODE="${NETWORK_MODE:-dhcp}"
+
   case "$NETWORK_MODE" in
     auto-copy)
       [[ -n "${DETECT_IP:-}" && -n "${DETECT_NETMASK:-}" && -n "${DETECT_GATEWAY:-}" ]] || \
-        die "NETWORK_MODE=auto-copy 失败：未能完整识别当前 IPv4/掩码/网关，请改用 NETWORK_MODE=dhcp 或 manual"
+        die "auto-copy 模式失败：未能完整识别当前 IPv4/掩码/网关，请改用 dhcp 或 manual"
       INSTALL_IP="$DETECT_IP"
       INSTALL_NETMASK="$DETECT_NETMASK"
       INSTALL_GATEWAY="$DETECT_GATEWAY"
       INSTALL_DNS="$(trim "${DETECT_DNS:-$DETECT_GATEWAY}")"
       INSTALL_HOSTNAME="${DETECT_HOSTNAME:-debian}"
       INSTALL_DOMAIN="${DETECT_DOMAIN:-localdomain}"
+      log "网络模式: 自动复制当前 IP ($INSTALL_IP)"
       ;;
     dhcp)
       INSTALL_IP=""
@@ -259,20 +325,28 @@ choose_network() {
       INSTALL_DNS=""
       INSTALL_HOSTNAME="${DETECT_HOSTNAME:-debian}"
       INSTALL_DOMAIN="${DETECT_DOMAIN:-localdomain}"
+      log "网络模式: DHCP（安装器自动获取）"
       ;;
     manual)
       if [[ ! -t 0 ]]; then
-        die "NETWORK_MODE=manual 需要交互式终端"
+        die "manual 模式需要交互式终端"
       fi
-      read -r -p "安装器使用的 IPv4 地址: " INSTALL_IP
-      read -r -p "子网掩码 (例如 255.255.255.0): " INSTALL_NETMASK
-      read -r -p "默认网关: " INSTALL_GATEWAY
-      read -r -p "DNS（多个用空格分隔）: " INSTALL_DNS
-      read -r -p "主机名 [${DETECT_HOSTNAME:-debian}]: " INSTALL_HOSTNAME
-      read -r -p "域名 [${DETECT_DOMAIN:-localdomain}]: " INSTALL_DOMAIN
+      step "手动填写网络参数"
+      read -r -p "  安装器使用的 IPv4 地址 [${DETECT_IP:-}]: " INSTALL_IP
+      INSTALL_IP="${INSTALL_IP:-${DETECT_IP:-}}"
+      read -r -p "  子网掩码 [${DETECT_NETMASK:-255.255.255.0}]: " INSTALL_NETMASK
+      INSTALL_NETMASK="${INSTALL_NETMASK:-${DETECT_NETMASK:-255.255.255.0}}"
+      read -r -p "  默认网关 [${DETECT_GATEWAY:-}]: " INSTALL_GATEWAY
+      INSTALL_GATEWAY="${INSTALL_GATEWAY:-${DETECT_GATEWAY:-}}"
+      read -r -p "  DNS 服务器 [${DETECT_DNS:-8.8.8.8}]: " INSTALL_DNS
+      INSTALL_DNS="${INSTALL_DNS:-${DETECT_DNS:-8.8.8.8}}"
+      read -r -p "  主机名 [${DETECT_HOSTNAME:-debian}]: " INSTALL_HOSTNAME
       INSTALL_HOSTNAME="${INSTALL_HOSTNAME:-${DETECT_HOSTNAME:-debian}}"
+      read -r -p "  域名 [${DETECT_DOMAIN:-localdomain}]: " INSTALL_DOMAIN
       INSTALL_DOMAIN="${INSTALL_DOMAIN:-${DETECT_DOMAIN:-localdomain}}"
-      [[ -n "$INSTALL_IP" && -n "$INSTALL_NETMASK" && -n "$INSTALL_GATEWAY" ]] || die "手动网络参数不能为空"
+      [[ -n "$INSTALL_IP" && -n "$INSTALL_NETMASK" && -n "$INSTALL_GATEWAY" ]] || \
+        die "IP / 掩码 / 网关不能为空"
+      log "网络模式: 手动静态 IP ($INSTALL_IP)"
       ;;
     *)
       die "NETWORK_MODE 仅支持 auto-copy / dhcp / manual"
@@ -280,6 +354,85 @@ choose_network() {
   esac
 }
 
+# ---------- SSH 配置向导 ----------
+wizard_ssh() {
+  if [[ -n "$SSH_PORT" && -n "$SSH_AUTH_MODE" ]]; then
+    return 0
+  fi
+
+  step "配置 SSH"
+
+  # SSH 端口
+  if [[ -z "$SSH_PORT" ]]; then
+    echo "  建议修改 SSH 端口以提高安全性（默认 22 容易被扫描攻击）"
+    read -r -p "  请输入安装后 SSH 端口 [默认 2222]: " _port
+    SSH_PORT="${_port:-2222}"
+  fi
+
+  # SSH 登录方式
+  if [[ -z "$SSH_AUTH_MODE" ]]; then
+    echo ""
+    echo "  SSH 登录方式："
+    echo "  1) 仅密钥登录（最安全，推荐）"
+    echo "  2) 密码 + 密钥均可"
+    echo "  3) 仅密码登录"
+    echo ""
+    read -r -p "  请选择 [默认 1]: " _am
+    case "${_am:-1}" in
+      2) SSH_AUTH_MODE="both" ;;
+      3) SSH_AUTH_MODE="password" ;;
+      *) SSH_AUTH_MODE="key-only" ;;
+    esac
+  fi
+
+  log "SSH 端口: $SSH_PORT  登录方式: $SSH_AUTH_MODE"
+}
+
+# ---------- 执行前确认摘要 ----------
+confirm_proceed() {
+  step "执行前确认 — 请仔细核对以下配置"
+  echo ""
+  printf '  %-22s %s\n' "Debian 版本:"      "$DEBIAN_VERSION ($DEBIAN_CODENAME)"
+  printf '  %-22s %s\n' "架构:"             "$DEBIAN_ARCH"
+  printf '  %-22s %s\n' "安装器镜像源:"    "$MIRROR_BASE"
+  echo ""
+  printf '  %-22s %s\n' "网络配置方式:"    "$NETWORK_MODE"
+  if [[ "$NETWORK_MODE" != "dhcp" ]]; then
+    printf '  %-22s %s\n' "安装器 IPv4:"    "$INSTALL_IP"
+    printf '  %-22s %s\n' "子网掩码:"       "$INSTALL_NETMASK"
+    printf '  %-22s %s\n' "网关:"           "$INSTALL_GATEWAY"
+    printf '  %-22s %s\n' "DNS:"            "$INSTALL_DNS"
+  else
+    printf '  %-22s %s\n' "安装器网络:"     "DHCP 自动获取"
+  fi
+  printf '  %-22s %s\n' "主机名:"          "${INSTALL_HOSTNAME:-debian}"
+  printf '  %-22s %s\n' "域名:"            "${INSTALL_DOMAIN:-localdomain}"
+  echo ""
+  printf '  %-22s %s\n' "root 密码:"       "已设置（不显示）"
+  printf '  %-22s %s\n' "SSH 端口:"        "$SSH_PORT"
+  printf '  %-22s %s\n' "SSH 登录方式:"    "$SSH_AUTH_MODE"
+  if [[ -n "$PUBKEY_TEXT" ]]; then
+    local first_line
+    first_line="$(printf '%s' "$PUBKEY_TEXT" | head -1)"
+    printf '  %-22s %s\n' "SSH 公钥:"       "${first_line:0:60}..."
+  fi
+  echo ""
+  printf '  %-22s %s\n' "自动重启:"        "$AUTO_REBOOT"
+  echo ""
+  warn "以上配置将被写入 GRUB 和安装器 initrd。重启后将进入 Debian 安装程序。"
+  warn "请确保已通过 VNC/控制台 连接，否则重启后将无法访问！"
+  echo ""
+
+  if [[ -t 0 ]]; then
+    read -r -p "确认无误，继续执行？[y/N]: " _confirm
+    case "${_confirm:-n}" in
+      [Yy]*) log "已确认，开始执行…" ;;
+      *) die "用户取消操作" ;;
+    esac
+  fi
+}
+
+# ---------- 文件校验（GPG + SHA256 全链路） ----------
 find_debian_keyring() {
   local candidates=(
     /usr/share/keyrings/debian-archive-keyring.gpg
@@ -298,9 +451,10 @@ find_debian_keyring() {
 }
 
 verify_installer_files() {
+  step "下载并校验 Debian 安装器文件"
   local keyring
   keyring="$(find_debian_keyring || true)"
-  [[ -n "$keyring" ]] || die "没有找到 Debian archive keyring。请先安装 debian-archive-keyring 后再运行。"
+  [[ -n "$keyring" ]] || die "没有找到 Debian archive keyring。请先运行：apt-get install -y debian-archive-keyring"
 
   local inrelease_url sha_url kernel_url initrd_url
   inrelease_url="$MIRROR_BASE/dists/$DEBIAN_CODENAME/InRelease"
@@ -308,16 +462,21 @@ verify_installer_files() {
   kernel_url="$MIRROR_BASE/dists/$DEBIAN_CODENAME/main/installer-$DEBIAN_ARCH/current/images/netboot/debian-installer/$DEBIAN_ARCH/linux"
   initrd_url="$MIRROR_BASE/dists/$DEBIAN_CODENAME/main/installer-$DEBIAN_ARCH/current/images/netboot/debian-installer/$DEBIAN_ARCH/initrd.gz"
 
-  log "下载 Debian 官方签名元数据与 netboot 文件"
+  info "正在下载文件（共 4 个）…"
+  log "1/4 下载 InRelease（官方签名元数据）"
   download "$inrelease_url" "$WORKDIR/InRelease"
+  log "2/4 下载 SHA256SUMS（校验清单）"
   download "$sha_url" "$WORKDIR/SHA256SUMS"
+  log "3/4 下载 linux（内核）"
   download "$kernel_url" "$WORKDIR/linux"
+  log "4/4 下载 initrd.gz（安装器内存盘）"
   download "$initrd_url" "$WORKDIR/initrd.orig.gz"
 
-  log "校验 InRelease 的 GPG 签名"
-  gpgv --keyring "$keyring" "$WORKDIR/InRelease" >/dev/null
+  log "校验 InRelease 的 GPG 签名（防篡改第一步）"
+  gpgv --keyring "$keyring" "$WORKDIR/InRelease" >/dev/null || \
+    die "GPG 验证失败！InRelease 可能被篡改，请检查网络或镜像源。"
 
-  log "校验 SHA256SUMS 是否受 InRelease 保护"
+  log "校验 SHA256SUMS 是否受 InRelease 保护（防篡改第二步）"
   local expected_sha256sums actual_sha256sums
   expected_sha256sums="$({
     awk -v f="main/installer-$DEBIAN_ARCH/current/images/SHA256SUMS" '
@@ -331,21 +490,27 @@ verify_installer_files() {
       }
     ' "$WORKDIR/InRelease"
   })"
-  [[ -n "$expected_sha256sums" ]] || die "未能从 InRelease 中提取 SHA256SUMS 的校验值"
+  [[ -n "$expected_sha256sums" ]] || die "未能从 InRelease 中提取 SHA256SUMS 的校验值，InRelease 格式异常"
   actual_sha256sums="$(sha256sum "$WORKDIR/SHA256SUMS" | awk '{print $1}')"
-  [[ "$expected_sha256sums" == "$actual_sha256sums" ]] || die "SHA256SUMS 校验失败，文件可能被篡改"
+  [[ "$expected_sha256sums" == "$actual_sha256sums" ]] || \
+    die "SHA256SUMS 校验失败！文件可能被篡改，请换一个镜像源重试。"
 
-  log "校验 linux 与 initrd.orig.gz"
+  log "校验 linux 与 initrd.gz（防篡改第三步）"
   local expected_kernel expected_initrd actual_kernel actual_initrd
-  expected_kernel="$(awk -v f="netboot/debian-installer/$DEBIAN_ARCH/linux" '{p=$2; sub(/^\.\//, "", p); if (p==f) {print $1; exit}}' "$WORKDIR/SHA256SUMS")"
-  expected_initrd="$(awk -v f="netboot/debian-installer/$DEBIAN_ARCH/initrd.gz" '{p=$2; sub(/^\.\//, "", p); if (p==f) {print $1; exit}}' "$WORKDIR/SHA256SUMS")"
+  expected_kernel="$(awk -v f="netboot/debian-installer/$DEBIAN_ARCH/linux" \
+    '{p=$2; sub(/^\.\//, "", p); if (p==f) {print $1; exit}}' "$WORKDIR/SHA256SUMS")"
+  expected_initrd="$(awk -v f="netboot/debian-installer/$DEBIAN_ARCH/initrd.gz" \
+    '{p=$2; sub(/^\.\//, "", p); if (p==f) {print $1; exit}}' "$WORKDIR/SHA256SUMS")"
   [[ -n "$expected_kernel" ]] || die "未能从 SHA256SUMS 中找到 linux 的校验值"
   [[ -n "$expected_initrd" ]] || die "未能从 SHA256SUMS 中找到 initrd.gz 的校验值"
   actual_kernel="$(sha256sum "$WORKDIR/linux" | awk '{print $1}')"
   actual_initrd="$(sha256sum "$WORKDIR/initrd.orig.gz" | awk '{print $1}')"
-  [[ "$expected_kernel" == "$actual_kernel" ]] || die "linux 校验失败，文件可能被篡改"
-  [[ "$expected_initrd" == "$actual_initrd" ]] || die "initrd.gz 校验失败，文件可能被篡改"
+  [[ "$expected_kernel" == "$actual_kernel" ]] || \
+    die "linux 内核校验失败！下载的文件可能被篡改，请重新运行脚本。"
+  [[ "$expected_initrd" == "$actual_initrd" ]] || \
+    die "initrd.gz 校验失败！下载的文件可能被篡改，请重新运行脚本。"
 
+  log "全部文件校验通过 ✓"
   run mkdir -p "$NETBOOT_DIR"
   run install -m 0644 "$WORKDIR/linux" "$NETBOOT_DIR/linux"
   run install -m 0644 "$WORKDIR/initrd.orig.gz" "$NETBOOT_DIR/initrd.orig.gz"
@@ -361,15 +526,11 @@ LOG
   chmod 0600 "$NETBOOT_DIR/VERIFY.log"
 }
 
+# ---------- 构建 SSH 配置脚本（注入 initrd） ----------
 build_ssh_setup_script() {
   local permit_root password_auth kbd_interactive
   case "$SSH_AUTH_MODE" in
-    password)
-      permit_root="yes"
-      password_auth="yes"
-      kbd_interactive="yes"
-      ;;
-    both)
+    password|both)
       permit_root="yes"
       password_auth="yes"
       kbd_interactive="yes"
@@ -384,89 +545,49 @@ build_ssh_setup_script() {
       ;;
   esac
 
-  local pubkey_block=""
-  if [[ -n "$PUBKEY_TEXT" ]]; then
-    pubkey_block=$(cat <<'KEYBLOCK'
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-cat > /root/.ssh/authorized_keys <<'EOF_AUTH_KEYS'
-__PUBKEY_TEXT__
-EOF_AUTH_KEYS
-chmod 600 /root/.ssh/authorized_keys
-KEYBLOCK
-)
-    pubkey_block="${pubkey_block//__PUBKEY_TEXT__/$PUBKEY_TEXT}"
-  fi
-
-  cat <<'EOS'
+  cat <<EOS
 #!/bin/sh
 set -eu
 cfg="/etc/ssh/sshd_config"
-[ -f "$cfg" ] || exit 0
-backup="${cfg}.bak-from-netboot-reinstall"
-[ -f "$backup" ] || cp -a "$cfg" "$backup"
+[ -f "\$cfg" ] || exit 0
+backup="\${cfg}.bak-from-netboot-reinstall"
+[ -f "\$backup" ] || cp -a "\$cfg" "\$backup"
 
 set_cfg() {
-  key="$1"
-  value="$2"
-  if grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "$cfg"; then
-    sed -ri "s@^[#[:space:]]*${key}[[:space:]].*@${key} ${value}@g" "$cfg"
+  key="\$1"
+  value="\$2"
+  if grep -Eq "^[#[:space:]]*\${key}[[:space:]]+" "\$cfg"; then
+    sed -ri "s@^[#[:space:]]*\${key}[[:space:]].*@\${key} \${value}@g" "\$cfg"
   else
-    printf '%s %s\n' "$key" "$value" >> "$cfg"
+    printf '%s %s\n' "\$key" "\$value" >> "\$cfg"
   fi
 }
 
-set_cfg Port __SSH_PORT__
-set_cfg PermitRootLogin __PERMIT_ROOT__
-set_cfg PasswordAuthentication __PASSWORD_AUTH__
-set_cfg KbdInteractiveAuthentication __KBD_INTERACTIVE__
+set_cfg Port ${SSH_PORT}
+set_cfg PermitRootLogin ${permit_root}
+set_cfg PasswordAuthentication ${password_auth}
+set_cfg KbdInteractiveAuthentication ${kbd_interactive}
 set_cfg PubkeyAuthentication yes
 set_cfg UsePAM yes
 
-__PUBKEY_BLOCK__
 EOS
+
+  if [[ -n "$PUBKEY_TEXT" ]]; then
+    printf 'mkdir -p /root/.ssh\n'
+    printf 'chmod 700 /root/.ssh\n'
+    printf 'cat > /root/.ssh/authorized_keys <<'"'"'EOF_AUTH_KEYS'"'"'\n'
+    printf '%s\n' "$PUBKEY_TEXT"
+    printf 'EOF_AUTH_KEYS\n'
+    printf 'chmod 600 /root/.ssh/authorized_keys\n'
+  fi
 }
 
+# ---------- 构建 preseed 配置 ----------
 build_preseed() {
+  step "生成预置文件（preseed.cfg）"
   local root_hash ssh_setup ssh_setup_b64
   root_hash="$(hash_password_sha512 "$ROOT_PASSWORD")"
-
   ssh_setup="$(build_ssh_setup_script)"
-  ssh_setup="${ssh_setup//__SSH_PORT__/$SSH_PORT}"
-  case "$SSH_AUTH_MODE" in
-    password)
-      ssh_setup="${ssh_setup//__PERMIT_ROOT__/yes}"
-      ssh_setup="${ssh_setup//__PASSWORD_AUTH__/yes}"
-      ssh_setup="${ssh_setup//__KBD_INTERACTIVE__/yes}"
-      ;;
-    both)
-      ssh_setup="${ssh_setup//__PERMIT_ROOT__/yes}"
-      ssh_setup="${ssh_setup//__PASSWORD_AUTH__/yes}"
-      ssh_setup="${ssh_setup//__KBD_INTERACTIVE__/yes}"
-      ;;
-    key-only)
-      ssh_setup="${ssh_setup//__PERMIT_ROOT__/prohibit-password}"
-      ssh_setup="${ssh_setup//__PASSWORD_AUTH__/no}"
-      ssh_setup="${ssh_setup//__KBD_INTERACTIVE__/no}"
-      ;;
-  esac
-  if [[ -n "$PUBKEY_TEXT" ]]; then
-    local block
-    block=$(cat <<'KEYBLOCK'
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-cat > /root/.ssh/authorized_keys <<'EOF_AUTH_KEYS'
-__PUBKEY_TEXT__
-EOF_AUTH_KEYS
-chmod 600 /root/.ssh/authorized_keys
-KEYBLOCK
-)
-    block="${block//__PUBKEY_TEXT__/$PUBKEY_TEXT}"
-    ssh_setup="${ssh_setup//__PUBKEY_BLOCK__/$block}"
-  else
-    ssh_setup="${ssh_setup//__PUBKEY_BLOCK__/}"
-  fi
-
   ssh_setup_b64="$(printf '%s' "$ssh_setup" | base64 | tr -d '\n')"
 
   : > "$WORKDIR/preseed.cfg"
@@ -496,9 +617,12 @@ KEYBLOCK
   } >> "$WORKDIR/preseed.cfg"
 
   chmod 0600 "$WORKDIR/preseed.cfg"
+  log "预置文件已生成"
 }
 
+# ---------- 将 preseed 注入 initrd ----------
 inject_preseed_into_initrd() {
+  step "将预置文件注入 initrd"
   local unpack_dir
   unpack_dir="$WORKDIR/initrd-unpack"
   run mkdir -p "$unpack_dir"
@@ -511,8 +635,10 @@ inject_preseed_into_initrd() {
   )
 
   chmod 0644 "$NETBOOT_DIR/initrd.gz"
+  log "initrd.gz 已生成（含预置配置）"
 }
 
+# ---------- 检测 GRUB 所需模块 ----------
 detect_grub_modules() {
   local path="$NETBOOT_DIR"
   GRUB_FS_UUID="$(findmnt -n -o UUID -T "$path" 2>/dev/null || true)"
@@ -530,7 +656,9 @@ detect_grub_modules() {
   GRUB_ABS="$(grub-probe -t abstraction "$path" 2>/dev/null || true)"
 }
 
+# ---------- 写入 GRUB 菜单项 ----------
 write_grub_entry() {
+  step "写入 GRUB 启动菜单"
   local grub_lines=""
   if [[ -n "$GRUB_ABS" && "$GRUB_ABS" != "diskfilter" ]]; then
     local a
@@ -545,22 +673,22 @@ write_grub_entry() {
     grub_lines+="    insmod ${GRUB_FS_MOD}"$'\n'
   fi
 
-  local kernel_args
-  kernel_args="priority=low"
-
   cat > "$GRUB_SCRIPT" <<EOF2
 #!/bin/sh
 exec tail -n +3 \$0
 menuentry '${MENU_TITLE}' {
 ${grub_lines}    search --no-floppy --fs-uuid --set=root ${GRUB_FS_UUID}
-    linux /netboot/linux ${kernel_args}
+    linux /netboot/linux priority=low
     initrd /netboot/initrd.gz
 }
 EOF2
   chmod 0755 "$GRUB_SCRIPT"
+  log "GRUB 菜单项已写入: $GRUB_SCRIPT"
 }
 
+# ---------- 更新 GRUB 配置 ----------
 update_grub_cfg() {
+  log "更新 GRUB 配置…"
   if command -v update-grub >/dev/null 2>&1; then
     run update-grub
   elif command -v grub-mkconfig >/dev/null 2>&1; then
@@ -573,60 +701,84 @@ update_grub_cfg() {
   else
     die "未找到 update-grub / grub-mkconfig / grub2-mkconfig"
   fi
+  log "GRUB 配置更新完成"
 }
 
+# ---------- 尝试设置下次启动项 ----------
 schedule_next_boot_if_possible() {
   if [[ "$AUTO_REBOOT" != "yes" ]]; then
     return 0
   fi
 
   if command -v grub-reboot >/dev/null 2>&1; then
-    grub-reboot "$MENU_TITLE" || warn "grub-reboot 执行失败，请通过 VNC 手动选择 GRUB 菜单中的安装项"
+    grub-reboot "$MENU_TITLE" 2>/dev/null || \
+      warn "grub-reboot 执行失败，请通过 VNC 手动在 GRUB 菜单中选择安装项"
   else
-    warn "系统没有 grub-reboot，无法保证下次只进安装器；请通过 VNC 手动选择 GRUB 菜单中的安装项"
+    warn "系统没有 grub-reboot，请通过 VNC 手动在 GRUB 菜单中选择安装项"
   fi
 }
 
+# ---------- 最终汇总与 VNC 操作说明 ----------
 print_summary() {
-  echo
-  echo "================ 已完成 ================="
-  echo "Debian 版本      : $DEBIAN_VERSION ($DEBIAN_CODENAME)"
-  echo "架构             : $DEBIAN_ARCH"
-  echo "网络模式         : $NETWORK_MODE"
-  if [[ "$NETWORK_MODE" == "dhcp" ]]; then
-    echo "安装器网络       : DHCP"
-  else
-    echo "安装器 IPv4      : $INSTALL_IP"
-    echo "安装器掩码       : $INSTALL_NETMASK"
-    echo "安装器网关       : $INSTALL_GATEWAY"
-    echo "安装器 DNS       : $INSTALL_DNS"
-  fi
-  echo "安装后 SSH 端口  : $SSH_PORT"
-  echo "安装后 SSH 模式  : $SSH_AUTH_MODE"
-  echo "GRUB 菜单名      : $MENU_TITLE"
-  echo "netboot 目录      : $NETBOOT_DIR"
-  echo "原始 initrd      : $NETBOOT_DIR/initrd.orig.gz"
-  echo "带预置 initrd    : $NETBOOT_DIR/initrd.gz"
-  echo "官方校验文件     : $NETBOOT_DIR/SHA256SUMS.official"
-  echo "校验日志         : $NETBOOT_DIR/VERIFY.log"
-  echo "预置文件（临时） : $WORKDIR/preseed.cfg"
-  echo "========================================"
-  echo
-  echo "后续说明："
-  echo "1) 通过 VNC/控制台 重启服务器。"
-  echo "2) 在 GRUB 中选择：$MENU_TITLE"
-  echo "3) 进入 Debian 安装器后，分区/格式化/软件源等继续手动完成。"
-  echo "4) 安装完成后，系统将只保留 root 账号；SSH 端口与 root 登录策略已按脚本预置。"
-  echo
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║                    脚本执行完成                             ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+  printf '  %-22s %s\n' "Debian 版本:"       "$DEBIAN_VERSION ($DEBIAN_CODENAME)"
+  printf '  %-22s %s\n' "架构:"              "$DEBIAN_ARCH"
+  printf '  %-22s %s\n' "netboot 目录:"      "$NETBOOT_DIR"
+  printf '  %-22s %s\n' "安装器内核:"        "$NETBOOT_DIR/linux"
+  printf '  %-22s %s\n' "安装器 initrd:"     "$NETBOOT_DIR/initrd.gz"
+  printf '  %-22s %s\n' "GRUB 菜单项:"       "$MENU_TITLE"
+
+  echo ""
+  echo "  ┌─ 安装后 SSH 配置 ──────────────────────────────────────┐"
+  printf '  │  %-20s %s\n' "SSH 端口:" "$SSH_PORT"
+  printf '  │  %-20s %s\n' "SSH 登录方式:" "$SSH_AUTH_MODE"
+  printf '  │  %-20s %s\n' "root 登录:" "已允许"
+  echo  "  └────────────────────────────────────────────────────────┘"
+
+  echo ""
+  echo "  ┌─ 文件安全校验 ─────────────────────────────────────────┐"
+  echo  "  │  GPG 签名验证: ✓ 通过（使用 Debian 官方 keyring）     │"
+  echo  "  │  SHA256 校验:  ✓ 通过（linux + initrd.gz）            │"
+  printf '  │  校验日志: %s\n' "$NETBOOT_DIR/VERIFY.log"
+  echo  "  └────────────────────────────────────────────────────────┘"
+
+  echo ""
+  echo "  ★★★ 下一步操作指引 ★★★"
+  echo ""
+  echo "  1. 在服务器控制面板打开 VNC 连接"
+  echo "  2. 执行重启命令（手动运行）："
+  echo ""
+  echo "       reboot"
+  echo ""
+  echo "  3. 重启后在 GRUB 菜单中选择："
+  echo ""
+  printf '       %s\n' "$MENU_TITLE"
+  echo ""
+  echo "  4. 进入 Debian 安装器后通过 VNC 手动操作："
+  echo "     - 确认网络配置（已预置，通常直接 Continue）"
+  echo "     - 选择磁盘分区方式（⚠ 此操作将清空磁盘！）"
+  echo "     - 选择软件和任务"
+  echo "     - root 密码已预置，安装器会自动设置"
+  echo "     - 安装完成后系统自动重启，SSH 端口为: $SSH_PORT"
+  echo ""
+
   if [[ "$AUTO_REBOOT" == "yes" ]]; then
-    echo "AUTO_REBOOT=yes：脚本接下来会尝试立即重启。请提前打开 VNC。"
+    warn "AUTO_REBOOT=yes：3 秒后自动重启，请确保 VNC 已打开！"
   else
-    echo "当前未自动重启；确认无误后请手动 reboot。"
+    info "确认 VNC 已连接后，执行 'reboot' 开始安装流程。"
   fi
+  echo ""
 }
 
+# ---------- 主流程 ----------
 main() {
+  banner
   require_root
+
   need_cmd awk
   need_cmd sed
   need_cmd grep
@@ -642,19 +794,35 @@ main() {
 
   WORKDIR="$(mktemp -d /tmp/debian-netboot-reinstall.XXXXXX)"
 
+  # 版本选择
   resolve_debian_release
+
+  # 网络检测（始终执行，不管选哪种模式）
   detect_network
+  show_detected_network
   choose_network
 
+  # SSH 端口与认证方式
+  wizard_ssh
+
+  # 校验 SSH 端口合法性
   [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH_PORT 必须是数字"
   (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die "SSH_PORT 必须在 1-65535 之间"
 
+  # root 密码
   if [[ -z "$ROOT_PASSWORD" ]]; then
-    [[ -t 0 ]] || die "ROOT_PASSWORD 为空且当前不是交互终端，请通过环境变量传入 ROOT_PASSWORD"
+    step "设置安装后 root 密码"
+    [[ -t 0 ]] || die "ROOT_PASSWORD 未设置且不是交互终端，请通过环境变量传入 ROOT_PASSWORD"
     read_secret_twice
   fi
 
+  # 公钥收集
   collect_pubkey
+
+  # 确认
+  confirm_proceed
+
+  # 下载、校验、注入、写 GRUB
   verify_installer_files
   build_preseed
   inject_preseed_into_initrd
